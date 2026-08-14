@@ -1998,6 +1998,52 @@ def localize_pdf(
                         ))
                 line_idx_counter += 1
 
+        # ── 动态识别标题行和正文行 ────────────────────────────────────
+        # 统计各行字号、字体、颜色，动态识别标题行
+        line_stats = {}  # {line_idx: {'size': float, 'font': str, 'color': int, 'y_pos': float, 'is_centered': bool}}
+        for line_idx, (sf, ss, sc) in line_first_style.items():
+            lb = line_bbox_map.get(line_idx, (0, 0, 0, 0))
+            # 判断是否居中：行中心距离页面中心的比例
+            page_width = page.rect.width
+            line_center_x = (lb[0] + lb[2]) / 2
+            page_center_x = page_width / 2
+            center_deviation = abs(line_center_x - page_center_x) / page_width
+            is_centered = center_deviation < 0.15  # 中心偏差<15%视为居中
+            line_stats[line_idx] = {
+                'size': float(ss),
+                'font': sf,
+                'color': sc,
+                'y_pos': lb[1],  # 顶部y坐标
+                'is_centered': is_centered,
+            }
+
+        # 统计字号分布，找出正文字号（众数或中位数）
+        all_sizes = [s['size'] for s in line_stats.values() if s['color'] == 0]  # 只统计黑色文字
+        if all_sizes:
+            from collections import Counter
+            size_counts = Counter(all_sizes)
+            # 正文字号：出现次数最多的字号
+            body_size = size_counts.most_common(1)[0][0]
+            # 标题字号阈值：明显大于正文（至少1.2倍）
+            title_size_threshold = body_size * 1.2
+            print(f"    [动态识别] 正文字号={body_size:.1f}pt, 标题阈值={title_size_threshold:.1f}pt")
+        else:
+            # 兜底：使用固定阈值
+            title_size_threshold = 18.0
+            print(f"    [动态识别] 未找到正文字号，使用固定阈值={title_size_threshold:.1f}pt")
+
+        # 标记标题行
+        title_line_indices_dynamic = set()
+        for line_idx, stats in line_stats.items():
+            is_title = (
+                stats['color'] == 0 and  # 黑色
+                stats['size'] >= title_size_threshold and  # 字号明显大于正文
+                stats['y_pos'] < page.rect.height * 0.5  # 在页面上半部分
+            )
+            if is_title:
+                title_line_indices_dynamic.add(line_idx)
+                print(f"    [动态识别] 标题行{line_idx}: 字号={stats['size']:.1f}pt, 字体={stats['font']}, 居中={stats['is_centered']}")
+
         # replace_ops_char = [(redact_rect, new_char, font_path, font_key, font_size, color_rgb, origin_x, origin_y), ...]
         replace_ops_char = []
         covered_char_indices = set()  # 防止同一字符被多个词条覆盖（防重影）
@@ -2029,50 +2075,80 @@ def localize_pdf(
             m = len(new_chars)
 
             for start_idx, seq in found_sequences:
-                # 取该行第一个字的样式——整行字号/字体/颜色统一（红头、标题不因 span 分段而不一致）
+                # 取该词第一个字的实际字体（seq[0][4]）和行首样式（用于判断红头/标题）
                 ch_line_idx = seq[0][7]
-                sf, ss, sc = line_first_style.get(ch_line_idx, (seq[0][4], seq[0][5], seq[0][6]))
+                line_sf, line_ss, line_sc = line_first_style.get(ch_line_idx, (seq[0][4], seq[0][5], seq[0][6]))
+
+                # 词条自己的字体、字号、颜色
+                sf = seq[0][4]  # 该词第一个字符的实际字体
+                ss = seq[0][5]  # 该词第一个字符的实际字号
+                sc = seq[0][6]  # 该词第一个字符的实际颜色
+
+                # 调试：打印原词的字体信息
+                if orig_word == "广东省":
+                    print(f"    [调试] 替换'{orig_word}'→'{new_word}':")
+                    print(f"      char_map字段检查: seq[0]={seq[0]}")
+                    print(f"      原词字体 sf='{sf}', 字号={ss}, 颜色={sc}")
+                    print(f"      行首字体 line_sf='{line_sf}', 字号={line_ss}, 颜色={line_sc}")
+
                 r_val = ((sc >> 16) & 0xFF) / 255.0
                 g_val = ((sc >> 8)  & 0xFF) / 255.0
                 b_val = ( sc        & 0xFF) / 255.0
                 color_rgb = (r_val, g_val, b_val)
-                is_red_line   = (sc == 16711680)
-                _sf_lower = sf.lower()
-                # 标题行：黑体标题 或 大字号（≥18）的宋体/黑体
-                is_title_line = (sc == 0 and float(ss) >= 18.0
-                                 and ("hei" in _sf_lower or "黑" in _sf_lower or "simhei" in _sf_lower
-                                      or "song" in _sf_lower or "宋" in _sf_lower or "simsun" in _sf_lower))
+
+                # 判断是否为红头/标题行：用动态识别结果
+                is_red_line   = (line_sc == 16711680)
+                is_title_line = (ch_line_idx in title_line_indices_dynamic)
+
+                # 调试：打印判断结果
+                if orig_word == "广东省":
+                    print(f"      is_red_line={is_red_line}, is_title_line={is_title_line}")
+                    print(f"      动态识别标题行集合: {title_line_indices_dynamic}")
+
                 # 正文/文号行统一用仿宋_GB2312，避免嵌入子集字体识别错误；红头和标题行保留原字体
                 if is_red_line or is_title_line:
-                    # 标题行的宋体使用加粗宋体，整行统一重写（临时测试：用SimSun代替）
-                    if is_title_line and ("song" in _sf_lower or "宋" in _sf_lower or "simsun" in _sf_lower):
-                        font_path = FONT_MAP["SimSun"]
-                        font_key  = "SimSun"
-                        print(f"    [调试] 标题行宋体词条替换: font_path={font_path}")
+                    # 红头和标题行：使用该词第一个字符的实际字体
+                    font_path = FONT_MAP.get(sf)
+                    if not font_path or not os.path.exists(font_path):
+                        # 模糊匹配
+                        sf_lower = sf.lower()
+                        if "fzxbs" in sf_lower or "xiaobiao" in sf_lower or "小标宋" in sf:
+                            # 方正小标宋：优先判断，避免被"宋"字误判
+                            font_path = FONT_MAP.get("FZXBSK", FONT_MAP["FangSong_GB2312"])
+                            if orig_word == "广东省":
+                                print(f"      模糊匹配→方正小标宋: font_path={font_path}")
+                        elif "fangsong" in sf_lower or "仿宋" in sf_lower:
+                            font_path = FONT_MAP["FangSong_GB2312"]
+                            if orig_word == "广东省":
+                                print(f"      模糊匹配→仿宋: font_path={font_path}")
+                        elif "hei" in sf_lower or "黑" in sf_lower:
+                            font_path = FONT_MAP["SimHei"]
+                            if orig_word == "广东省":
+                                print(f"      模糊匹配→黑体: font_path={font_path}")
+                        elif "song" in sf_lower or "宋" in sf_lower:
+                            font_path = FONT_MAP["SimSun"]
+                            if orig_word == "广东省":
+                                print(f"      模糊匹配→宋体: font_path={font_path}")
+                        else:
+                            # 兜底：红头行用方正小标宋
+                            font_path = FONT_MAP.get("FZXBSK", FONT_MAP["FangSong_GB2312"])
+                            if orig_word == "广东省":
+                                print(f"      模糊匹配→兜底方正小标宋: font_path={font_path}")
                     else:
-                        # 红头和其他标题行：直接从 FONT_MAP 查找字体
-                        font_path = FONT_MAP.get(sf)
-                        if not font_path or not os.path.exists(font_path):
-                            # 模糊匹配
-                            sf_lower = sf.lower()
-                            if "fangsong" in sf_lower or "仿宋" in sf_lower:
-                                font_path = FONT_MAP["FangSong_GB2312"]
-                            elif "hei" in sf_lower or "黑" in sf_lower:
-                                font_path = FONT_MAP["SimHei"]
-                            elif "song" in sf_lower or "宋" in sf_lower:
-                                font_path = FONT_MAP["SimSun"]
-                            elif "fzxbs" in sf_lower or "xiaobiao" in sf_lower:
-                                # 方正小标宋：改用仿宋代替（方正小标宋在PyMuPDF中可能无法嵌入）
-                                font_path = FONT_MAP["FangSong_GB2312"]
-                                print(f"    [调试] 方正小标宋改用仿宋: {font_path}")
-                            else:
-                                font_path = FONT_MAP["FangSong_GB2312"]
-                        font_key  = re.sub(r'[^A-Za-z0-9]', '', sf)[:16] or "F0"
-                        if is_red_line:
-                            print(f"    [调试] 红头词条替换: sf={sf}, font_path={font_path}")
+                        if orig_word == "广东省":
+                            print(f"      直接匹配成功: font_path={font_path}")
+                    # 使用新的fontname避免与PDF中已有字体冲突
+                    font_key = "ReplaceFont"  # 统一使用新名称，强制使用fontfile
                 else:
                     font_path = FONT_MAP["FangSong_GB2312"]
                     font_key  = "FangSongGB"
+                    if orig_word == "广东省":
+                        print(f"      非红头/标题行，使用仿宋: font_path={font_path}")
+
+                if orig_word == "广东省":
+                    print(f"      最终使用字体: {font_path}")
+                    print(f"      fontname={font_key}")
+
                 font_size = float(ss)
 
                 # 计算每个新字的插入位置
@@ -2120,21 +2196,16 @@ def localize_pdf(
                         return fitz.Rect(cx0, iy0, cx1, iy1)
                     return fitz.Rect(cx0, cy0, cx1, cy1)
 
-                # 红头行：用 span 原始字号作为统一字号，纵向拉伸至行高
+                # 红头行：用 span 原始字号，不拉伸
                 _line_lb = line_bbox_map.get(ch_line_idx, None)
                 _line_h = (_line_lb[3] - _line_lb[1]) if _line_lb else (seq[0][3][3] - seq[0][3][1])
                 if is_red_line:
                     _fs_unified = font_size  # 直接用 span 原始字号，全行一致
-                    try:
-                        from PIL import ImageFont as _IF2, Image as _Im2, ImageDraw as _Dr2
-                        _tmp2 = _Im2.new("RGB", (200, 200))
-                        _drw2 = _Dr2.Draw(_tmp2)
-                        _pf2 = _IF2.truetype(font_path, int(_fs_unified))
-                        _bb2 = _drw2.textbbox((0, 0), seq[0][0], font=_pf2)
-                        _prh2 = max(_bb2[3] - _bb2[1], 1)
-                        _sy_unified = _line_h / _prh2 if _prh2 > 0 else 1.0
-                    except Exception:
-                        _sy_unified = 1.0
+                    print(f"      [红头调试-词条替换] 原始字号 ss = {ss}")
+                    print(f"      [红头调试-词条替换] 测量时使用字号 _fs_unified = {_fs_unified}")
+                    # 不进行纵向拉伸计算，保持 1.0
+                    _sy_unified = 1.0
+                    print(f"      [红头调试-词条替换] scale_y = {_sy_unified} (不拉伸)")
 
                 for j, new_char in enumerate(new_chars):
                     if j < len(positions):
@@ -2154,7 +2225,7 @@ def localize_pdf(
                             _er,
                             new_char, font_path, font_key,
                             _fs_unified, color_rgb, ox, oy,
-                            (1.0, _sy_unified),
+                            (1.0, _sy_unified),  # 不拉伸
                         ))
                     else:
                         replace_ops_char.append((
@@ -2172,24 +2243,15 @@ def localize_pdf(
         }
 
         def _is_title_line(line_sc, line_ss, line_sf):
-            """判断是否为标题行：黑色 + (黑体或宋体) + 字号≥18pt。
-            如果是宋体标题行，后续会强制用加粗宋体重写整行。"""
-            if line_sc != 0:
-                return False
-            if float(line_ss) < 18.0:
-                return False
-            lf = line_sf.lower()
-            return ("hei" in lf or "黑" in lf or "simhei" in lf or
-                    "song" in lf or "宋" in lf or "simsun" in lf)
+            """判断是否为标题行：使用动态识别结果。"""
+            # 查找该行在 line_first_style 中的索引
+            for line_idx, (sf, ss, sc) in line_first_style.items():
+                if sf == line_sf and abs(float(ss) - float(line_ss)) < 0.01 and sc == line_sc:
+                    return line_idx in title_line_indices_dynamic
+            return False
 
-        # 收集所有标题行的行号
-        title_line_indices = set()
-        for ci, ch_info in enumerate(char_map):
-            ch_li = ch_info[7]
-            line_sf, line_ss, line_sc = line_first_style.get(ch_li, (ch_info[4], ch_info[5], ch_info[6]))
-            is_title = _is_title_line(line_sc, line_ss, line_sf)
-            if is_title:
-                title_line_indices.add(ch_li)
+        # 收集所有标题行的行号（已在动态识别中完成）
+        title_line_indices = title_line_indices_dynamic
 
         # 逐字处理标题行和红头行
         for ci, ch_info in enumerate(char_map):
@@ -2225,7 +2287,9 @@ def localize_pdf(
                 if not fp or not os.path.exists(fp):
                     # 模糊匹配原字体
                     ch_sf_lower = ch_sf.lower()
-                    if "song" in ch_sf_lower or "宋" in ch_sf_lower or "simsun" in ch_sf_lower:
+                    if "fzxbs" in ch_sf_lower or "xiaobiao" in ch_sf_lower or "小标宋" in ch_sf:
+                        fp = FONT_MAP.get("FZXBSK", FONT_MAP["SimSun"])
+                    elif "song" in ch_sf_lower or "宋" in ch_sf_lower or "simsun" in ch_sf_lower:
                         fp = FONT_MAP["SimSun"]
                     elif "hei" in ch_sf_lower or "黑" in ch_sf_lower:
                         fp = FONT_MAP["SimHei"]
@@ -2235,7 +2299,8 @@ def localize_pdf(
                         fp = FONT_MAP.get("TimesNewRoman", FONT_MAP["SimSun"])
                     else:
                         fp = FONT_MAP["SimSun"]  # 兜底
-                fk = re.sub(r'[^A-Za-z0-9]', '', ch_sf)[:16] or "F0"
+                # 使用新的fontname避免与PDF中已有字体冲突
+                fk = "TitleFont"  # 统一使用新名称，强制使用fontfile
                 fs_r = float(ch_ss)  # 使用字符原始字号
                 rr = fitz.Rect(ch_bbox[0], ch_bbox[1], ch_bbox[2], ch_bbox[3])
                 ox = ch_ox  # 使用原始x坐标
@@ -2248,41 +2313,35 @@ def localize_pdf(
             _line_lb_r = line_bbox_map.get(ch_li, None)
             _line_h_r = (_line_lb_r[3] - _line_lb_r[1]) if _line_lb_r else max(int(ch_bbox[3] - ch_bbox[1]), 1)
 
-            # 红头行：用颜色mask精确遮盖，统一用 span 原始字号，纵向拉伸至行高
+            # 红头行：用颜色mask精确遮盖，统一用 span 原始字号，不拉伸
             if arr is not None:
                 ink_y0, ink_y1 = _red_ink_bounds(arr, ch_bbox[0], ch_bbox[1], ch_bbox[2], ch_bbox[3], _scale)
                 rr = fitz.Rect(ch_bbox[0], ink_y0, ch_bbox[2], ink_y1)
             else:
                 rr = fitz.Rect(ch_bbox[0], ch_bbox[1], ch_bbox[2], ch_bbox[3])
 
-            # 获取红头字体
+            # 获取红头字体（从行首字体line_sf）
             lf_lower = line_sf.lower()
             fp = FONT_MAP.get(line_sf)
             if not fp or not os.path.exists(fp):
                 # 模糊匹配
-                if "fangsong" in lf_lower or "仿宋" in lf_lower:
+                if "fzxbs" in lf_lower or "xiaobiao" in lf_lower:
+                    # 方正小标宋：使用FONT_MAP中配置的路径
+                    fp = FONT_MAP.get("FZXBSK", FONT_MAP["FangSong_GB2312"])
+                elif "fangsong" in lf_lower or "仿宋" in lf_lower:
                     fp = FONT_MAP["FangSong_GB2312"]
                 elif "hei" in lf_lower or "黑" in lf_lower:
                     fp = FONT_MAP["SimHei"]
                 elif "song" in lf_lower or "宋" in lf_lower:
                     fp = FONT_MAP["SimSun"]
                 else:
-                    fp = FONT_MAP["FangSong_GB2312"]
+                    # 兜底：红头用方正小标宋
+                    fp = FONT_MAP.get("FZXBSK", FONT_MAP["FangSong_GB2312"])
             fk = re.sub(r'[^A-Za-z0-9]', '', line_sf)[:16] or "F0"
 
             fs_r = float(line_ss)
-            # 纵向拉伸：用 PIL 测原字号下该字的渲染高度，算出 scale_y
-            try:
-                from PIL import ImageFont as _IF, Image as _Im, ImageDraw as _Dr
-                _tmp = _Im.new("RGB", (200, 200))
-                _drw = _Dr.Draw(_tmp)
-                _pf = _IF.truetype(fp, int(fs_r))
-                _bb = _drw.textbbox((0, 0), ch_c, font=_pf)
-                _prh = max(_bb[3] - _bb[1], 1)
-                _sy_r = _line_h_r / _prh if _prh > 0 else 1.0
-            except Exception:
-                _sy_r = 1.0
-            stretch = (1.0, _sy_r)
+            # 不拉伸，保持原字号
+            stretch = (1.0, 1.0)
 
             ox = ch_ox  # 使用原始x坐标
             replace_ops_char.append((rr, ch_c, fp, fk, fs_r, (r, g, b), ox, ch_oy, stretch))
@@ -2326,164 +2385,116 @@ def localize_pdf(
                         morph = (fitz.Point(ox, oy), fitz.Matrix(sx, 0, 0, sy, 0, 0))
                 elif stretch_info != 1.0:
                     morph = (fitz.Point(ox, oy), fitz.Matrix(stretch_info, 0, 0, 1, 0, 0))
+
                 page.insert_text((ox, oy), new_char, fontname=fk, fontfile=fp,
                                  fontsize=fs, color=color_rgb, morph=morph)
                 page_replaced += 1
             except Exception as e:
                 print(f"    写入失败 [{new_char}] 第{page_num+1}页: {e}")
 
-        # 红头行：测量原字间距，按原间距排列补丁，若超宽则压缩
-        for base_oy, ops in red_line_ops.items():
-            if not ops:
-                continue
-            # 取第一个 op 的字号和拉伸作为全行统一参数
-            _, _, fp0, fk0, fs0, color_rgb0, _, _, stretch0 = ops[0]
-            sx0 = stretch0[0] if isinstance(stretch0, tuple) else stretch0
-            sy0 = stretch0[1] if isinstance(stretch0, tuple) else 1.0
+        # 红头行：统一居中处理，保持与原红头相同的总宽度
+        if red_line_ops:
+            print(f"      [红头处理] 共{len(red_line_ops)}行红头")
 
-            # 原红头行的 x 范围和字符间距
-            all_rects = [op[0] for op in ops if op[0] is not None]
-            if all_rects:
+            for base_oy, ops in red_line_ops.items():
+                if not ops:
+                    continue
+
+                print(f"      [红头] 处理{len(ops)}个字符的红头行")
+
+                # 1. 获取第一个字符的字体和拉伸参数（全行统一）
+                _, _, fp0, fk0, fs0, color_rgb0, _, _, stretch0 = ops[0]
+                sx0 = stretch0[0] if isinstance(stretch0, tuple) else stretch0
+                sy0 = stretch0[1] if isinstance(stretch0, tuple) else 1.0
+
+                print(f"      [红头调试-居中写入] 写入 fontsize = {fs0}")
+                print(f"      [红头调试-居中写入] 原始 scale_y = {sy0} (已改为不拉伸)")
+                print(f"      [红头调试-居中写入] 字体文件路径 = {fp0}")
+
+                # 2. 计算原红头行的范围
+                all_rects = [op[0] for op in ops if op[0] is not None]
+                if not all_rects:
+                    print(f"      [红头] 警告：没有有效的矩形区域，跳过")
+                    continue
+
                 line_x0 = min(r.x0 for r in all_rects)
                 line_x1 = max(r.x1 for r in all_rects)
-                orig_line_width = line_x1 - line_x0
-                # 计算原字间距：总宽度 / (字符数 - 1)，如果只有1个字则间距=0
-                orig_char_spacing = orig_line_width / (len(ops) - 1) if len(ops) > 1 else 0
-            else:
-                line_x0 = ops[0][6]
-                line_x1 = ops[-1][6]
-                orig_line_width = line_x1 - line_x0
-                orig_char_spacing = 0
-            line_cx = (line_x0 + line_x1) / 2
-
-            # 用 PIL 测量每个新字在 fs0 字号下的渲染宽度
-            _tmp_img = _Imc.new("RGB", (2000, 200))
-            _tmp_drw = _Drc.Draw(_tmp_img)
-            try:
-                _pil_f = _IFc.truetype(fp0, int(fs0))
-            except Exception:
-                _pil_f = _IFc.load_default()
-
-            char_widths = []
-            for op in ops:
-                _, ch, *_ = op
-                try:
-                    bb = _tmp_drw.textbbox((0, 0), ch, font=_pil_f)
-                    char_widths.append(max(bb[2] - bb[0], 1))
-                except Exception:
-                    char_widths.append(int(fs0))
-
-            # 按原字间距计算补丁总宽度
-            pure_char_width = sum(char_widths)
-            total_spacing = orig_char_spacing * (len(ops) - 1) if len(ops) > 1 else 0
-            patch_width_with_spacing = pure_char_width + total_spacing
-
-            # 检查补丁宽度是否与原红头一致
-            _scale_x = 1.0
-            final_char_spacing = orig_char_spacing
-
-            # 策略1：如果补丁宽度与原宽度差异较大（>5%），压缩到原宽度
-            if abs(patch_width_with_spacing - orig_line_width) > orig_line_width * 0.05:
-                # 横向压缩：保持字间距不变，只压缩字符本身
-                _scale_x = (orig_line_width - total_spacing) / pure_char_width if pure_char_width > 0 else 1.0
-                scaled_char_widths = [w * _scale_x for w in char_widths]
-                final_total_w = sum(scaled_char_widths) + total_spacing
-                print(f"      红头补丁宽度({patch_width_with_spacing:.1f}pt)与原宽度({orig_line_width:.1f}pt)不一致，压缩字符到{final_total_w:.1f}pt (字间距保持{orig_char_spacing:.1f}pt)")
-                char_widths = scaled_char_widths
-            else:
-                print(f"      红头补丁宽度({patch_width_with_spacing:.1f}pt)与原宽度({orig_line_width:.1f}pt)接近，保持原字间距{orig_char_spacing:.1f}pt")
-
-            total_w = sum(char_widths) + total_spacing
-
-            # 删除整行原字的文字层 + 白色覆盖
-            if all_rects:
                 line_y0 = min(r.y0 for r in all_rects)
                 line_y1 = max(r.y1 for r in all_rects)
-                line_rect = fitz.Rect(line_x0, line_y0, line_x1, line_y1)
-                # 添加 redact 标注删除文字层
-                page.add_redact_annot(line_rect, fill=(1, 1, 1))
+                line_cx = (line_x0 + line_x1) / 2  # 中心x坐标
+                orig_total_width = line_x1 - line_x0  # 原红头总宽度
 
-        # 应用所有红头行的 redact 标注
-        if red_line_ops:
-            page.apply_redactions()
+                print(f"      [红头] 原红头: x=[{line_x0:.1f}, {line_x1:.1f}], 中心={line_cx:.1f}, 总宽={orig_total_width:.1f}pt")
+                print(f"      [红头调试-居中写入] 原红头总宽度 = {orig_total_width:.1f}pt")
 
-        # 重新遍历红头行写入新文字（按原字间距 + 居中）
-        for base_oy, ops in red_line_ops.items():
-            if not ops:
-                continue
-            _, _, fp0, fk0, fs0, color_rgb0, _, _, stretch0 = ops[0]
-            sx0 = stretch0[0] if isinstance(stretch0, tuple) else stretch0
-            sy0 = stretch0[1] if isinstance(stretch0, tuple) else 1.0
+                # 3. 先删除原红头（redact）
+                redact_rect = fitz.Rect(line_x0, line_y0, line_x1, line_y1)
+                page.add_redact_annot(redact_rect, fill=(1, 1, 1))
+                page.apply_redactions()
+                print(f"      [红头] 已删除原红头区域")
 
-            # 原红头行的 x 范围和字符间距
-            all_rects = [op[0] for op in ops if op[0] is not None]
-            if all_rects:
-                line_x0 = min(r.x0 for r in all_rects)
-                line_x1 = max(r.x1 for r in all_rects)
-                orig_line_width = line_x1 - line_x0
-                orig_char_spacing = orig_line_width / (len(ops) - 1) if len(ops) > 1 else 0
-            else:
-                line_x0 = ops[0][6]
-                line_x1 = ops[-1][6]
-                orig_line_width = line_x1 - line_x0
-                orig_char_spacing = 0
-            line_cx = (line_x0 + line_x1) / 2
-
-            _tmp_img = _Imc.new("RGB", (2000, 200))
-            _tmp_drw = _Drc.Draw(_tmp_img)
-            try:
-                _pil_f = _IFc.truetype(fp0, int(fs0))
-            except Exception:
-                _pil_f = _IFc.load_default()
-
-            char_widths = []
-            for op in ops:
-                _, ch, *_ = op
+                # 4. 用PIL测量新红头每个字的宽度（使用完整字号，不截断）
+                _tmp_img = _Imc.new("RGB", (2000, 200))
+                _tmp_drw = _Drc.Draw(_tmp_img)
                 try:
-                    bb = _tmp_drw.textbbox((0, 0), ch, font=_pil_f)
-                    char_widths.append(max(bb[2] - bb[0], 1))
+                    _pil_f = _IFc.truetype(fp0, fs0)  # 使用完整字号，避免int()截断
                 except Exception:
-                    char_widths.append(int(fs0))
+                    _pil_f = _IFc.load_default()
 
-            # 按原字间距计算补丁总宽度
-            pure_char_width = sum(char_widths)
-            total_spacing = orig_char_spacing * (len(ops) - 1) if len(ops) > 1 else 0
-            patch_width_with_spacing = pure_char_width + total_spacing
+                char_widths = []
+                for op in ops:
+                    _, ch, *_ = op
+                    try:
+                        bb = _tmp_drw.textbbox((0, 0), ch, font=_pil_f)
+                        char_widths.append(max(bb[2] - bb[0], 1))
+                    except Exception:
+                        char_widths.append(fs0)  # 兜底使用字号
 
-            # 检查补丁宽度是否与原红头一致，如果不一致则压缩
-            _scale_x = 1.0
-            if abs(patch_width_with_spacing - orig_line_width) > orig_line_width * 0.05:
-                _scale_x = (orig_line_width - total_spacing) / pure_char_width if pure_char_width > 0 else 1.0
-                char_widths = [w * _scale_x for w in char_widths]
+                total_char_width = sum(char_widths)
+                print(f"      [红头调试-居中写入] 新文本测量总宽度 = {total_char_width:.1f}pt")
 
-            total_w = sum(char_widths) + total_spacing
+                # 5. 计算横向压缩比例和字间距
+                # 策略：不使用morph压缩，而是保持原字号，通过负字间距实现总宽度匹配
+                scale_x = 1.0  # 不进行横向压缩
 
-            # 居中起始 x
-            x_cursor = line_cx - total_w / 2
-
-            print(f"      [红头调试] 写入{len(ops)}个字符: 居中x={line_cx:.1f}, 总宽={total_w:.1f}, 起始x={x_cursor:.1f}")
-
-            for idx_op, op in enumerate(ops):
-                _, new_char, fp, fk, fs, color_rgb, _, oy, stretch_info = op
-                cw = char_widths[idx_op]
-                ox = x_cursor
-                # 加上字间距（除了最后一个字）
-                if idx_op < len(ops) - 1:
-                    x_cursor += cw + orig_char_spacing
+                # 计算字间距（可能为负）
+                if len(ops) > 1:
+                    char_spacing = (orig_total_width - total_char_width) / (len(ops) - 1)
                 else:
-                    x_cursor += cw
-                try:
-                    morph = None
-                    sx_final = _scale_x  # 横向压缩（未超出时为 1.0）
-                    if sy0 != 1.0 or sx_final != 1.0:
-                        morph = (fitz.Point(ox, oy), fitz.Matrix(sx_final, 0, 0, sy0, 0, 0))
-                    page.insert_text((ox, oy), new_char, fontname=fk0, fontfile=fp0,
-                                     fontsize=fs0, color=color_rgb0, morph=morph)
-                    page_replaced += 1
-                    if idx_op < 3:  # 只打印前3个字的详细信息
-                        print(f"        字'{new_char}': x={ox:.1f}, y={oy:.1f}, 字号={fs0:.1f}, 颜色={color_rgb0}, 字体={fk0}")
-                except Exception as e:
-                    print(f"    写入失败(红头) [{new_char}] 第{page_num+1}页: {e}")
+                    char_spacing = 0
+
+                new_total_width = total_char_width + char_spacing * (len(ops) - 1)
+                print(f"      [红头调试-居中写入] 不使用横向压缩 scale_x = 1.0")
+                print(f"      [红头调试-居中写入] 字间距 = {char_spacing:.1f}pt (负值表示字符重叠)")
+                print(f"      [红头] 新红头: 字宽={total_char_width:.1f}pt, 字间距={char_spacing:.1f}pt, 总宽={new_total_width:.1f}pt")
+
+                # 6. 计算居中起始位置
+                start_x = line_cx - new_total_width / 2
+
+                # 7. 逐字写入（不使用morph，通过字间距调整总宽度）
+                x_cursor = start_x
+                for idx_op, op in enumerate(ops):
+                    _, new_char, fp, fk, fs, color_rgb, _, oy, stretch_info = op
+                    cw = char_widths[idx_op]
+
+                    try:
+                        # 不使用morph变换，保持原字号
+                        page.insert_text((x_cursor, oy), new_char, fontname=fk0, fontfile=fp0,
+                                         fontsize=fs0, color=color_rgb0)
+                        page_replaced += 1
+
+                        if idx_op < 3:
+                            print(f"        字'{new_char}': x={x_cursor:.1f}, y={oy:.1f}, 宽={cw:.1f}, 字间距={char_spacing:.1f}")
+
+                        # 移动到下一个字的起始位置（字宽 + 字间距）
+                        if idx_op < len(ops) - 1:
+                            x_cursor += cw + char_spacing
+                        else:
+                            x_cursor += cw
+                    except Exception as e:
+                        print(f"    [红头] 写入失败 [{new_char}]: {e}")
+
+                print(f"      [红头] 完成写入，最终x={x_cursor:.1f}")
 
         if page_replaced:
             print(f"    第{page_num+1}页：替换{page_replaced}处")
