@@ -300,30 +300,31 @@ def call_vision(image_bytes: bytes, mime: str, prompt: str, config: dict) -> str
 MAPPING_SYSTEM = """你是一个政府公文地域替换助手。
 
 从用户提供的公文原文中，找出与原省份/城市相关的地理标识，输出替换词表。
-**只替换能体现地点的词**，机关职能、业务类型等非地点信息一律不改。
+规则：**只替换地点部分，机关职能、业务类型、项目名称一字不动。**
 
-必须替换的两类词：
-1. 独立出现的省份名或直辖市名（如"广东省"、"天津市"）→ 目标省份名
-   注意：即使省份名出现在机关名称内部（如"广东省人力资源和社会保障厅"），也要单独输出省份名的替换条目（如{"广东省":"福建省"}），不要替换整个机关名。
-2. 发文字号中的**单字省市简称**（如"津"、"粤"、"渝"、"京"等），只替换这一个字。
-   - 正确示范：原文有"津市场监管审批〔2020〕1号" → 只输出 {"津": "闽"}
-   - 错误示范：{"津市场监管审批": "闽人社规"} ← 绝对不要，机关类型不属于地点信息
+替换规则（只有以下三类）：
 
-举例（目标省份福建省）：
-- 原文有"广东省" → {"广东省": "福建省"}
-- 原文有"津市场监管审批〔2020〕1号" → {"津": "闽"}（只改省市简称这一个字）
-- 原文有"粤人社规〔2021〕5号" → {"粤": "闽"}（只改省市简称这一个字）
-- 原文有"广东" → {"广东": "福建"}
-- 原文有"天津" → {"天津": "福建"}
+1. 省份名/直辖市名/城市名 → 目标省份名
+   - "广东省" → "福建省"，"天津市" → "福建省"，"南京市" → "福建省"
+   - "广东" → "福建"，"南京" → "福建"
+
+2. 机关名称：**只把其中的省份/城市部分换成目标省份，职能部分原样保留**
+   - "广东省人力资源和社会保障厅" → "福建省人力资源和社会保障厅"（只改"广东省"→"福建省"，职能"人力资源和社会保障厅"不动）
+   - "南京市发展和改革委员会" → "福建省发展和改革委员会"（只改"南京市"→"福建省"，职能"发展和改革委员会"不动）
+   - "重庆高新区生态环境局" → "福建省生态环境局"（只改地点，职能"生态环境局"不动）
+
+3. 发文字号中的省市简称单字 → 目标省简称
+   - "宁发改财金字〔2018〕××号" → {"宁": "闽"}（只改"宁"这一个字，后面的"发改财金字"不动）
+   - "粤人社规〔2021〕5号" → {"粤": "闽"}（只改"粤"，"人社规"不动）
 
 绝对不替换：
-- 整个机关名称全称
-- 机关职能/业务类型部分（如"市场监管审批"、"人社"、"办函"等）
 - 企业名称、项目名称
-- 正文叙述句中的地名
-- URL、电话、编号中的地域信息
+- 正文中描述历史事实的地名（如"与广东省签订了合同"）
+- URL、电话、编号
+- **不含具体省市名的机关缩写**：如"省发展改革委"、"省人社厅"、"市住建局"——这些缩写里没有可替换的地点，不要输出这类词条
+- 机关名称中的职能部分（"人力资源和社会保障厅"、"发展和改革委员会"等）绝对不能改为其他职能
 
-每条原词必须是可在原文中直接搜索到的完整词，不含换行符，长度不超过10字。
+每条原词必须是可在原文中直接搜索到的完整词，不含换行符，长度不超过25字。
 只输出纯 JSON 对象，格式：{"原词": "新词"}，不加任何解释。"""
 
 
@@ -378,16 +379,37 @@ def _extract_word_pairs(orig_val: str, new_val: str, mapping: dict):
 
 def build_replacement_mapping(raw_text: str, src_province: str,
                                tgt_province: str, tgt_authority: str,
-                               config: dict) -> dict:
+                               config: dict,
+                               src_authorities: list = None) -> dict:
     """
     让 LLM 直接从原文提取"省份名/机关名/发文字号前缀"这三类短词的替换词表。
     每条原词必须是可在原文中直接搜索到的完整词组，长度≤25字符。
+    src_authorities: 已识别的原发文机关列表（可多个），用于在 prompt 中明确告知 LLM。
     """
+    # 构造发文机关提示行
+    if src_authorities and len(src_authorities) > 0:
+        auth_hint = "原发文机关（已识别）：" + "、".join(src_authorities) + "\n"
+    else:
+        auth_hint = ""
+
+    # 多机关时额外提示：目标机关只是参考，各机关按职能各自对口替换
+    if src_authorities and len(src_authorities) > 1:
+        auths_joined = "、".join(src_authorities)
+        multi_auth_note = (
+            f"\n【重要】本文有{len(src_authorities)}个联合发文机关：{auths_joined}。"
+            f"每个机关只把省市地点前缀改为\u300c福建省\u300d或\u300c闽\u300d，职能后缀原样保留，不要把不同职能的机关名混淆合并。"
+            f"例如：城市管理局\u2192福建省城市管理局，规划局\u2192福建省规划局，不要都变成{tgt_authority}。"
+        )
+    else:
+        multi_auth_note = ""
+
     user_prompt = (
         f"公文原文：\n\n{raw_text[:4000]}\n\n"
+        f"{auth_hint}"
         f"目标省份：{tgt_province}\n"
-        f"目标机关：{tgt_authority}\n\n"
+        f"目标机关（参考）：{tgt_authority}\n\n"
         f"请输出替换词表，只替换省份名、机关名和发文字号前缀这三类短词。"
+        + multi_auth_note
     )
     try:
         result = _call_llm_json(MAPPING_SYSTEM, user_prompt, config)
@@ -398,22 +420,26 @@ def build_replacement_mapping(raw_text: str, src_province: str,
     if not isinstance(result, dict):
         return {}
 
-    # 过滤：原词必须在原文中可搜索到，长度≤10，不含换行
-    # 同时排除 LLM 擅自替换机关名的情况：
-    #   - 原词含"局"/"厅"/"委"/"办"/"院"等机关字样 → 跳过
-    #   - 新词与目标机关全称完全相同 → 跳过（说明 LLM 把某机关换成了我们的目标机关）
-    ORG_CHARS = set('局厅委办院部署处队所站')
+    # 常见省市名前缀，用于判断原词是否含有可替换的地点成分
+    _PROVINCE_CITY_PREFIXES = (
+        '北京', '天津', '上海', '重庆', '河北', '山西', '辽宁', '吉林', '黑龙江',
+        '江苏', '浙江', '安徽', '福建', '江西', '山东', '河南', '湖北', '湖南',
+        '广东', '广西', '海南', '四川', '贵州', '云南', '陕西', '甘肃', '青海',
+        '内蒙古', '西藏', '新疆', '宁夏', '香港', '澳门', '台湾',
+        '南京', '杭州', '宁波', '武汉', '成都', '西安', '沈阳', '哈尔滨',
+        '济南', '青岛', '厦门', '深圳', '广州', '长沙', '郑州', '合肥', '石家庄',
+    )
+
+    # 过滤：原词必须在原文中可搜索到，长度≤25，不含换行
     mapping = {}
     for k, v in result.items():
         if not (k and v and k != v and "\n" not in k and k in raw_text):
             continue
-        if len(k) > 10:
+        if len(k) > 25:
             continue
-        if any(c in k for c in ORG_CHARS):
-            print(f"  [过滤] 含机关字: [{k}] → [{v}]")
-            continue
-        if v == tgt_authority:
-            print(f"  [过滤] 新词是目标机关全称: [{k}] → [{v}]")
+        # 防止 LLM 把无地点前缀的机关缩写（如"省发展改革委"）整体映射为目标机关全称
+        # 规则：若新词等于目标机关全称，但原词不以任何已知省/市名开头，则丢弃
+        if v == tgt_authority and not any(k.startswith(p) for p in _PROVINCE_CITY_PREFIXES):
             continue
         mapping[k] = v
 
@@ -465,12 +491,15 @@ FONT_DETECT_PROMPT = """请识别这张中国政府公文图片中每一行文�
 字体识别规律：
 - 顶部红色大字版头 → 方正小标宋, red, bold, region=red_header
 - 发文字号（如"津市场监管审批〔2020〕1号"）→ 仿宋_GB2312, bold=false, region=doc_number
+  **重要**：发文字号必须包含完整内容，特别是末尾的"号"字，x2坐标要确保包含"号"字的右边界
 - 正文标题（一、二、三、等加粗行）→ 黑体, bold=true, region=title
 - 正文每行 → 仿宋_GB2312, region=body
 - 落款、成文日期 → 仿宋_GB2312, region=body
 - 页面最底部版记：印发单位和印发日期（如"XX办公室  2020年2月3日印发"）→ 仿宋_GB2312, region=imprint
 
-注意：x1/y1/x2/y2 是该行文字在图片中的实际像素坐标，尽量精确到行高。
+注意：
+1. x1/y1/x2/y2 是该行文字在图片中的实际像素坐标，尽量精确到行高
+2. 发文字号的x2必须包含最后的"号"字，不能截断
 只输出JSON数组，不加任何解释。"""
 
 
@@ -1509,6 +1538,53 @@ def localize_image(
     body_font_cache    = {_default_font_path: body_font_global}
     imprint_font_cache = {_default_font_path: imprint_font_global}
 
+    # ── 预处理：识别连续的标题行组 ──
+    title_groups = []  # [(start_idx, end_idx), ...]
+    i = 0
+    while i < len(active_blocks):
+        block = active_blocks[i]
+        region = block.get("region_classified") or block.get("region", "") or ""
+        font_name = block.get("font", "")
+        bold = block.get("bold", False)
+        color_hint = block.get("color", "black")
+        by1 = block.get("y1")
+        is_red = (color_hint == "red")
+        is_title = (region == "title") or ((font_name == "黑体" or bold) and not is_red and region != "doc_number")
+
+        if is_title:
+            # 找到连续的标题行
+            start_idx = i
+            end_idx = i
+            last_y2 = block.get("y2", 0)
+
+            for j in range(i + 1, len(active_blocks)):
+                next_block = active_blocks[j]
+                next_region = next_block.get("region_classified") or next_block.get("region", "") or ""
+                next_font = next_block.get("font", "")
+                next_bold = next_block.get("bold", False)
+                next_color = next_block.get("color", "black")
+                next_y1 = next_block.get("y1")
+                next_is_red = (next_color == "red")
+                next_is_title = (next_region == "title") or ((next_font == "黑体" or next_bold) and not next_is_red and next_region != "doc_number")
+
+                # 检查是否连续（y坐标间隔小于3倍字高）
+                if next_is_title and next_y1 and last_y2 and (next_y1 - last_y2 < median_body_h * 3):
+                    end_idx = j
+                    last_y2 = next_block.get("y2", last_y2)
+                else:
+                    break
+
+            title_groups.append((start_idx, end_idx))
+            i = end_idx + 1
+        else:
+            i += 1
+
+    # 标记哪些行属于标题组
+    title_group_map = {}  # {block_idx: group_id}
+    for group_id, (start_idx, end_idx) in enumerate(title_groups):
+        for idx in range(start_idx, end_idx + 1):
+            title_group_map[idx] = group_id
+
     for block in active_blocks:
         orig_text = block.get("text", "").strip()
         if not orig_text:
@@ -1551,10 +1627,19 @@ def localize_image(
                 modified_text = modified_text.replace(orig_word, new_word)
                 line_has_change = True
 
-        # 红头/文号/标题：只要含替换词（或红头无条件）就整行一个补丁贴上去
-        # 正文/印发：只在含替换词时处理
-        is_special_line = is_red or (region in ("doc_number", "title")) or is_title
-        should_rewrite_whole_line = is_special_line and (line_has_change or is_red)
+        # 发文文号：统一将各种括号转换为方头括号
+        if region == "doc_number":
+            # 替换所有可能的括号变体
+            modified_text = modified_text.replace('（', '〔').replace('）', '〕')  # 中文圆括号
+            modified_text = modified_text.replace('(', '〔').replace(')', '〕')    # 英文圆括号
+            modified_text = modified_text.replace('[', '〔').replace(']', '〕')    # 方括号
+            modified_text = modified_text.replace('【', '〔').replace('】', '〕')  # 中文方括号
+            modified_text = modified_text.replace('{', '〔').replace('}', '〕')    # 花括号
+
+        # 红头：无条件整行处理
+        # 文号/标题/正文：有替换词时整行处理
+        # 印发：有替换词时处理
+        should_rewrite_whole_line = is_red or (line_has_change and region in ("doc_number", "title", "body")) or (is_title and line_has_change)
 
         if not line_has_change and not is_red:
             continue
@@ -1627,6 +1712,16 @@ def localize_image(
                 )
                 print(f"    逐字贴回(红头): [{orig_text[:20]}] → [{modified_text[:20]}]")
             else:
+                # 发文文号：右边扩展3个字的宽度
+                if region == "doc_number":
+                    char_width_estimate = effective_h  # 估算一个字的宽度约等于字高
+                    right_expand = char_width_estimate * 3
+                    bx2_expanded = min(bx2 + right_expand, W)
+                else:
+                    bx2_expanded = bx2
+
+                _inpaint_erase(img, bx1 - 4, by1, bx2_expanded + 4, by2, W, H, is_red, bg_color=bg_color)
+                pw = max(bx2_expanded - bx1, 1); ph = max(by2 - by1, 1)
                 patch = Image.new("RGB", (pw, ph), bg_color)
                 pd = ImageDraw.Draw(patch)
                 bb = pd.textbbox((0, 0), modified_text, font=pil_font)
@@ -1696,7 +1791,7 @@ def localize_image(
                     word_bg = _sample_bg(img, ax0, ay0, ax1, ay1, W, H)
                     _inpaint_erase(img, ax0 - 2 - left_expand, ay0,
                                    ax1 + 2 + right_expand, ay1,
-                                   W, H, is_red, expand=0, bg_color=word_bg)
+                                   W, H, is_red, bg_color=word_bg)
 
                     # 用 render_replacement_chars 逐字写入（传入 blur_sigma）
                     word_positions = [char_positions_all[i]
@@ -1719,12 +1814,12 @@ def localize_image(
 
 
 def _inpaint_erase(img: "Image.Image", x1: int, y1: int, x2: int, y2: int,
-                   W: int, H: int, is_red: bool = False, expand: int = 0,
+                   W: int, H: int, is_red: bool = False, expand: int = 2,
                    bg_color: tuple = None) -> None:
     """
     用背景色矩形覆盖原文字区域，完全不透明。
     bg_color 为 None 时从周边像素采样（自适应米白/浅灰扫描件背景）。
-    expand：向上下各扩展 expand 像素，覆盖笔画溢出。
+    expand：向上下各扩展 expand 像素，覆盖笔画溢出（默认2pt）。
     """
     if bg_color is None:
         bg_color = _sample_bg(img, x1, y1, x2, y2, W, H)
@@ -1862,6 +1957,7 @@ def localize_pdf(
     output_dir: Path,
     font_dir: Path = None,
     no_preview: bool = False,
+    src_authorities: list = None,
 ) -> Path:
     """PDF 格式保留本地化主流程。"""
     if not FITZ_OK:
@@ -1893,7 +1989,7 @@ def localize_pdf(
         raw_text = "\n".join(ocr_parts)
 
     print("  [PDF] Step2: LLM生成替换词表...")
-    mapping = build_replacement_mapping(raw_text, "", tgt_province, tgt_authority, config)
+    mapping = build_replacement_mapping(raw_text, "", tgt_province, tgt_authority, config, src_authorities=src_authorities)
     print(f"  替换词表（{len(mapping)}条）:")
     for k, v in mapping.items():
         print(f"    [{k}] → [{v}]")
@@ -2048,30 +2144,52 @@ def localize_pdf(
         replace_ops_char = []
         covered_char_indices = set()  # 防止同一字符被多个词条覆盖（防重影）
 
-        for orig_word, new_word in mapping.items():
-            # 在 char_map 里找连续匹配 orig_word 的字符序列
-            orig_chars = list(orig_word)
+        for orig_word, new_word in sorted(mapping.items(), key=lambda x: -len(x[0])):
+            # 在 char_map 里找匹配 orig_word 的字符序列
+            # 支持字间有空格的情况（如红头字间距排版：南 京 市 规 划 局）
+            # 两边都去掉空格：orig_chars 和 char_map 中的空格均跳过
+            orig_chars = [c for c in orig_word if c != ' ']
             n = len(orig_chars)
-            found_sequences = []  # 每次匹配到的字符列表
+            found_sequences = []
 
             i = 0
-            while i <= len(char_map) - n:
+            while i < len(char_map):
                 # 跳过已被其他词条覆盖的字符
-                if any((i + j) in covered_char_indices for j in range(n)):
+                if i in covered_char_indices:
                     i += 1
                     continue
-                if all(char_map[i + j][0] == orig_chars[j] for j in range(n)):
-                    found_sequences.append((i, char_map[i:i + n]))
-                    for j in range(n):
-                        covered_char_indices.add(i + j)
-                    i += n
-                else:
-                    i += 1
+                # 从位置i开始，跳过空格，尝试匹配orig_chars
+                matched = []
+                j = i
+                k = 0
+                while k < n and j < len(char_map):
+                    ch_c = char_map[j][0]
+                    if ch_c == ' ':  # 跳过 char_map 中的空格
+                        j += 1
+                        continue
+                    if ch_c == orig_chars[k]:
+                        matched.append((j, char_map[j]))
+                        j += 1
+                        k += 1
+                    else:
+                        break
+                if k == n and matched:
+                    # 全部匹配，记录实际字符位置（含中间空格）
+                    all_indices = list(range(matched[0][0], matched[-1][0] + 1))
+                    seq = [char_map[idx] for idx in all_indices if char_map[idx][0] != ' ']
+                    # 确认没有被覆盖
+                    if not any(idx in covered_char_indices for idx in all_indices):
+                        found_sequences.append((i, seq))
+                        for idx in all_indices:
+                            covered_char_indices.add(idx)
+                        i = matched[-1][0] + 1
+                        continue
+                i += 1
 
             if not found_sequences:
                 continue
 
-            new_chars = list(new_word)
+            new_chars = [c for c in new_word if c != ' ']
             m = len(new_chars)
 
             for start_idx, seq in found_sequences:
@@ -2084,13 +2202,6 @@ def localize_pdf(
                 ss = seq[0][5]  # 该词第一个字符的实际字号
                 sc = seq[0][6]  # 该词第一个字符的实际颜色
 
-                # 调试：打印原词的字体信息
-                if orig_word == "广东省":
-                    print(f"    [调试] 替换'{orig_word}'→'{new_word}':")
-                    print(f"      char_map字段检查: seq[0]={seq[0]}")
-                    print(f"      原词字体 sf='{sf}', 字号={ss}, 颜色={sc}")
-                    print(f"      行首字体 line_sf='{line_sf}', 字号={line_ss}, 颜色={line_sc}")
-
                 r_val = ((sc >> 16) & 0xFF) / 255.0
                 g_val = ((sc >> 8)  & 0xFF) / 255.0
                 b_val = ( sc        & 0xFF) / 255.0
@@ -2100,11 +2211,6 @@ def localize_pdf(
                 is_red_line   = (line_sc == 16711680)
                 is_title_line = (ch_line_idx in title_line_indices_dynamic)
 
-                # 调试：打印判断结果
-                if orig_word == "广东省":
-                    print(f"      is_red_line={is_red_line}, is_title_line={is_title_line}")
-                    print(f"      动态识别标题行集合: {title_line_indices_dynamic}")
-
                 # 正文/文号行统一用仿宋_GB2312，避免嵌入子集字体识别错误；红头和标题行保留原字体
                 if is_red_line or is_title_line:
                     # 红头和标题行：使用该词第一个字符的实际字体
@@ -2113,41 +2219,23 @@ def localize_pdf(
                         # 模糊匹配
                         sf_lower = sf.lower()
                         if "fzxbs" in sf_lower or "xiaobiao" in sf_lower or "小标宋" in sf:
-                            # 方正小标宋：优先判断，避免被"宋"字误判
                             font_path = FONT_MAP.get("FZXBSK", FONT_MAP["FangSong_GB2312"])
-                            if orig_word == "广东省":
-                                print(f"      模糊匹配→方正小标宋: font_path={font_path}")
                         elif "fangsong" in sf_lower or "仿宋" in sf_lower:
                             font_path = FONT_MAP["FangSong_GB2312"]
-                            if orig_word == "广东省":
-                                print(f"      模糊匹配→仿宋: font_path={font_path}")
                         elif "hei" in sf_lower or "黑" in sf_lower:
                             font_path = FONT_MAP["SimHei"]
-                            if orig_word == "广东省":
-                                print(f"      模糊匹配→黑体: font_path={font_path}")
                         elif "song" in sf_lower or "宋" in sf_lower:
                             font_path = FONT_MAP["SimSun"]
-                            if orig_word == "广东省":
-                                print(f"      模糊匹配→宋体: font_path={font_path}")
                         else:
-                            # 兜底：红头行用方正小标宋
                             font_path = FONT_MAP.get("FZXBSK", FONT_MAP["FangSong_GB2312"])
-                            if orig_word == "广东省":
-                                print(f"      模糊匹配→兜底方正小标宋: font_path={font_path}")
+                    # 使用不同的fontname：红头行用"RedHeadFont"，标题行用"TitleFont"
+                    if is_red_line:
+                        font_key = "RedHeadFont"
                     else:
-                        if orig_word == "广东省":
-                            print(f"      直接匹配成功: font_path={font_path}")
-                    # 使用新的fontname避免与PDF中已有字体冲突
-                    font_key = "ReplaceFont"  # 统一使用新名称，强制使用fontfile
+                        font_key = "TitleFont"
                 else:
                     font_path = FONT_MAP["FangSong_GB2312"]
                     font_key  = "FangSongGB"
-                    if orig_word == "广东省":
-                        print(f"      非红头/标题行，使用仿宋: font_path={font_path}")
-
-                if orig_word == "广东省":
-                    print(f"      最终使用字体: {font_path}")
-                    print(f"      fontname={font_key}")
 
                 font_size = float(ss)
 
@@ -2200,12 +2288,8 @@ def localize_pdf(
                 _line_lb = line_bbox_map.get(ch_line_idx, None)
                 _line_h = (_line_lb[3] - _line_lb[1]) if _line_lb else (seq[0][3][3] - seq[0][3][1])
                 if is_red_line:
-                    _fs_unified = font_size  # 直接用 span 原始字号，全行一致
-                    print(f"      [红头调试-词条替换] 原始字号 ss = {ss}")
-                    print(f"      [红头调试-词条替换] 测量时使用字号 _fs_unified = {_fs_unified}")
-                    # 不进行纵向拉伸计算，保持 1.0
+                    _fs_unified = font_size
                     _sy_unified = 1.0
-                    print(f"      [红头调试-词条替换] scale_y = {_sy_unified} (不拉伸)")
 
                 for j, new_char in enumerate(new_chars):
                     if j < len(positions):
@@ -2337,7 +2421,8 @@ def localize_pdf(
                 else:
                     # 兜底：红头用方正小标宋
                     fp = FONT_MAP.get("FZXBSK", FONT_MAP["FangSong_GB2312"])
-            fk = re.sub(r'[^A-Za-z0-9]', '', line_sf)[:16] or "F0"
+            # 使用固定fontname避免与PDF嵌入字体冲突
+            fk = "RedHeadFont"
 
             fs_r = float(line_ss)
             # 不拉伸，保持原字号
@@ -2396,6 +2481,9 @@ def localize_pdf(
         if red_line_ops:
             print(f"      [红头处理] 共{len(red_line_ops)}行红头")
 
+            # ── Pass 1：计算每行的写入参数，同时收集所有 redact 矩形 ──
+            red_line_write_plans = []  # [(line_cx, base_oy, actual_fontsize, char_spacing, char_widths, ops)]
+
             for base_oy, ops in red_line_ops.items():
                 if not ops:
                     continue
@@ -2404,12 +2492,6 @@ def localize_pdf(
 
                 # 1. 获取第一个字符的字体和拉伸参数（全行统一）
                 _, _, fp0, fk0, fs0, color_rgb0, _, _, stretch0 = ops[0]
-                sx0 = stretch0[0] if isinstance(stretch0, tuple) else stretch0
-                sy0 = stretch0[1] if isinstance(stretch0, tuple) else 1.0
-
-                print(f"      [红头调试-居中写入] 写入 fontsize = {fs0}")
-                print(f"      [红头调试-居中写入] 原始 scale_y = {sy0} (已改为不拉伸)")
-                print(f"      [红头调试-居中写入] 字体文件路径 = {fp0}")
 
                 # 2. 计算原红头行的范围
                 all_rects = [op[0] for op in ops if op[0] is not None]
@@ -2421,79 +2503,97 @@ def localize_pdf(
                 line_x1 = max(r.x1 for r in all_rects)
                 line_y0 = min(r.y0 for r in all_rects)
                 line_y1 = max(r.y1 for r in all_rects)
-                line_cx = (line_x0 + line_x1) / 2  # 中心x坐标
-                orig_total_width = line_x1 - line_x0  # 原红头总宽度
+                line_cx = (line_x0 + line_x1) / 2
+                orig_text_width = line_x1 - line_x0
 
-                print(f"      [红头] 原红头: x=[{line_x0:.1f}, {line_x1:.1f}], 中心={line_cx:.1f}, 总宽={orig_total_width:.1f}pt")
-                print(f"      [红头调试-居中写入] 原红头总宽度 = {orig_total_width:.1f}pt")
+                if _red_rule_width > 0:
+                    target_width = _red_rule_width
+                    print(f"      [红头] 原红头文字宽度={orig_text_width:.1f}pt, 红线宽度={_red_rule_width:.1f}pt, 使用红线宽度作为目标")
+                else:
+                    target_width = orig_text_width
+                    print(f"      [红头] 原红头文字宽度={target_width:.1f}pt (无红线)")
 
-                # 3. 先删除原红头（redact）
+                if _red_rule_width > 0:
+                    page_center_x = page.rect.width / 2
+                    line_cx = page_center_x
+                    print(f"      [红头] 使用页面中心 x={page_center_x:.1f}")
+                else:
+                    print(f"      [红头] 使用原红头中心 x={line_cx:.1f}")
+
+                # 3. 收集 redact 矩形（不立即 apply）
                 redact_rect = fitz.Rect(line_x0, line_y0, line_x1, line_y1)
                 page.add_redact_annot(redact_rect, fill=(1, 1, 1))
-                page.apply_redactions()
-                print(f"      [红头] 已删除原红头区域")
 
-                # 4. 用PIL测量新红头每个字的宽度（使用完整字号，不截断）
+                # 4. 用PIL测量新红头每个字的宽度
                 _tmp_img = _Imc.new("RGB", (2000, 200))
                 _tmp_drw = _Drc.Draw(_tmp_img)
-                try:
-                    _pil_f = _IFc.truetype(fp0, fs0)  # 使用完整字号，避免int()截断
-                except Exception:
-                    _pil_f = _IFc.load_default()
 
                 char_widths = []
                 for op in ops:
-                    _, ch, *_ = op
+                    _, ch, fp_char, *_ = op
                     try:
-                        bb = _tmp_drw.textbbox((0, 0), ch, font=_pil_f)
+                        _pil_f_char = _IFc.truetype(fp_char, fs0)
+                        bb = _tmp_drw.textbbox((0, 0), ch, font=_pil_f_char)
                         char_widths.append(max(bb[2] - bb[0], 1))
                     except Exception:
-                        char_widths.append(fs0)  # 兜底使用字号
+                        char_widths.append(fs0)
 
                 total_char_width = sum(char_widths)
-                print(f"      [红头调试-居中写入] 新文本测量总宽度 = {total_char_width:.1f}pt")
+                print(f"      [红头] 新文本测量总宽度 = {total_char_width:.1f}pt（各字符使用各自字体）")
 
-                # 5. 计算横向压缩比例和字间距
-                # 策略：不使用morph压缩，而是保持原字号，通过负字间距实现总宽度匹配
-                scale_x = 1.0  # 不进行横向压缩
+                # 5. 计算字号和字间距
+                actual_fontsize = fs0
+                char_spacing = 0
 
-                # 计算字间距（可能为负）
-                if len(ops) > 1:
-                    char_spacing = (orig_total_width - total_char_width) / (len(ops) - 1)
-                else:
+                if total_char_width > target_width:
+                    actual_fontsize = fs0 * (target_width / total_char_width)
+                    print(f"      [红头] 新文本过宽，缩小字号：{fs0:.2f}pt → {actual_fontsize:.2f}pt")
+
+                    char_widths = []
+                    for op in ops:
+                        _, ch, fp_char, *_ = op
+                        try:
+                            _pil_f_adjusted = _IFc.truetype(fp_char, actual_fontsize)
+                            bb = _tmp_drw.textbbox((0, 0), ch, font=_pil_f_adjusted)
+                            char_widths.append(max(bb[2] - bb[0], 1))
+                        except Exception:
+                            char_widths.append(actual_fontsize)
+
+                    total_char_width = sum(char_widths)
                     char_spacing = 0
+                    print(f"      [红头] 调整后总宽度 = {total_char_width:.1f}pt，字间距 = 0")
+                else:
+                    if len(ops) > 1:
+                        char_spacing = (target_width - total_char_width) / (len(ops) - 1)
+                    else:
+                        char_spacing = 0
+                    print(f"      [红头] 字号保持 {fs0:.2f}pt，字间距 = {char_spacing:.1f}pt")
 
                 new_total_width = total_char_width + char_spacing * (len(ops) - 1)
-                print(f"      [红头调试-居中写入] 不使用横向压缩 scale_x = 1.0")
-                print(f"      [红头调试-居中写入] 字间距 = {char_spacing:.1f}pt (负值表示字符重叠)")
-                print(f"      [红头] 新红头: 字宽={total_char_width:.1f}pt, 字间距={char_spacing:.1f}pt, 总宽={new_total_width:.1f}pt")
+                print(f"      [红头] 最终: 字宽={total_char_width:.1f}pt, 字间距={char_spacing:.1f}pt, 总宽={new_total_width:.1f}pt")
 
-                # 6. 计算居中起始位置
+                red_line_write_plans.append((line_cx, new_total_width, actual_fontsize, char_spacing, char_widths, ops))
+
+            # ── Pass 2：所有红头行 redact 一次性 apply，再统一写入 ──
+            page.apply_redactions()
+            print(f"      [红头] 已删除所有红头区域")
+
+            for line_cx, new_total_width, actual_fontsize, char_spacing, char_widths, ops in red_line_write_plans:
                 start_x = line_cx - new_total_width / 2
-
-                # 7. 逐字写入（不使用morph，通过字间距调整总宽度）
                 x_cursor = start_x
                 for idx_op, op in enumerate(ops):
                     _, new_char, fp, fk, fs, color_rgb, _, oy, stretch_info = op
                     cw = char_widths[idx_op]
-
                     try:
-                        # 不使用morph变换，保持原字号
-                        page.insert_text((x_cursor, oy), new_char, fontname=fk0, fontfile=fp0,
-                                         fontsize=fs0, color=color_rgb0)
+                        page.insert_text((x_cursor, oy), new_char, fontname=fk, fontfile=fp,
+                                         fontsize=actual_fontsize, color=color_rgb)
                         page_replaced += 1
-
-                        if idx_op < 3:
-                            print(f"        字'{new_char}': x={x_cursor:.1f}, y={oy:.1f}, 宽={cw:.1f}, 字间距={char_spacing:.1f}")
-
-                        # 移动到下一个字的起始位置（字宽 + 字间距）
                         if idx_op < len(ops) - 1:
                             x_cursor += cw + char_spacing
                         else:
                             x_cursor += cw
                     except Exception as e:
                         print(f"    [红头] 写入失败 [{new_char}]: {e}")
-
                 print(f"      [红头] 完成写入，最终x={x_cursor:.1f}")
 
         if page_replaced:
@@ -2505,10 +2605,296 @@ def localize_pdf(
     doc.close()
     print(f"  ✓ PDF输出: {out_path} （共替换{total_replaced}处）")
 
+    # 生成PNG预览图
+    print(f"  [PDF] 生成PNG预览图...")
+    doc_preview = fitz.open(str(out_path))
+    preview_count = len(doc_preview)
+    for page_num in range(preview_count):
+        page = doc_preview[page_num]
+        # 使用2倍分辨率渲染，提高清晰度
+        mat = fitz.Matrix(2.0, 2.0)
+        pix = page.get_pixmap(matrix=mat)
+
+        # 保存为PNG
+        png_path = output_dir / f"{pdf_path.stem}_localized_page{page_num + 1}.png"
+        pix.save(str(png_path))
+        print(f"    第{page_num + 1}页 → {png_path.name}")
+
+    doc_preview.close()
+    print(f"  ✓ 共生成 {preview_count} 张PNG预览图")
+
     return out_path
 
 
 # ─────────────────────────────────────────────
+# ─────────────────────────────────────────────
+# 发文主体识别
+# ─────────────────────────────────────────────
+
+def detect_issuing_authority_from_pdf(pdf_path: Path, config: dict = None) -> str:
+    """从PDF识别发文主体。
+    路径0：LLM从第一页文字识别（最准确，需要config）
+    路径1：落款文字层（日期行上方）
+    路径2：文字层红色 span
+    路径3：矢量路径红色填充矩形 + RapidOCR
+    """
+    if not FITZ_OK:
+        return ""
+    import re as _re
+    _DATE_PAT = _re.compile(r'[○〇一二三四五六七八九十×X\d]{4}\s*年\s*[○〇×X一二三四五六七八九十\d]{1,2}\s*月')
+
+    try:
+        doc = fitz.open(str(pdf_path))
+        page = doc[0]
+        page_h = page.rect.height
+        page_w = page.rect.width
+
+        # 找红线位置：最靠上那条横跨页面宽度60%以上的水平线（页面前40%内）
+        # 页脚红线在80%以上，不会命中
+        red_line_y = None
+        for d in page.get_drawings():
+            if d.get("type") == "l":
+                pts = d.get("items", [])
+                for item in pts:
+                    if item[0] == "l":
+                        p1, p2 = item[1], item[2]
+                        if abs(p1.y - p2.y) < 3 and abs(p1.x - p2.x) > page_w * 0.6:
+                            y_pos = (p1.y + p2.y) / 2
+                            if y_pos / page_h < 0.40:
+                                if red_line_y is None or y_pos < red_line_y:
+                                    red_line_y = y_pos
+        # 也从细长矩形检测红线（必须是红色填充或红色描边）
+        for d in page.get_drawings():
+            rect = d.get("rect")
+            if not (rect and rect.height < 5 and rect.width > page_w * 0.6):
+                continue
+            if rect.y0 / page_h >= 0.40:
+                continue
+            # 检查颜色：填充色或描边色为红色
+            fill = d.get("fill") or (0, 0, 0)
+            stroke = d.get("color") or (0, 0, 0)
+            is_red = (
+                (fill[0] > 0.6 and fill[1] < 0.3 and fill[2] < 0.3) or
+                (stroke[0] > 0.6 and stroke[1] < 0.3 and stroke[2] < 0.3)
+            )
+            if is_red:
+                if red_line_y is None or rect.y0 < red_line_y:
+                    red_line_y = rect.y0
+
+        # 提取红线以上的文字（兜底用页面前35%）
+        cutoff_y = red_line_y if red_line_y else page_h * 0.35
+        # 先收集 (y, text) 对
+        raw_header_lines = []
+        for block in page.get_text("dict")["blocks"]:
+            if block.get("type") != 0:
+                continue
+            for line in block.get("lines", []):
+                if line["bbox"][1] < cutoff_y:
+                    text = "".join(s["text"] for s in line["spans"]).strip()
+                    y = line["bbox"][1]
+                    if text:
+                        raw_header_lines.append((y, text))
+        # 把 y 坐标相近（±5pt）且为单字的行合并成一行（字间距红头场景）
+        raw_header_lines.sort(key=lambda x: x[0])
+        merged_lines = []
+        i = 0
+        while i < len(raw_header_lines):
+            y0, t0 = raw_header_lines[i]
+            # 收集同 y 行（±5pt 内）
+            group = [(y0, t0)]
+            j = i + 1
+            while j < len(raw_header_lines) and abs(raw_header_lines[j][0] - y0) < 8:
+                group.append(raw_header_lines[j])
+                j += 1
+            # 如果全是单字，合并
+            if all(len(t) == 1 for _, t in group) and len(group) > 1:
+                merged_lines.append("".join(t for _, t in group))
+            else:
+                for _, t in group:
+                    merged_lines.append(t)
+            i = j
+        header_text = "\n".join(merged_lines)
+
+        # 路径0：先用正则从 merged_lines 中提取机关名（不依赖LLM，准确率高）
+        _ORG_PAT = _re.compile(
+            r'^(?:(?:[\u4e00-\u9fff]{2,8}(?:省|市|区|县|自治区|自治州))+)'
+            r'[\u4e00-\u9fff]{2,12}'
+            r'(?:局|厅|委|办|院|部|署|社|站|队|中心|委员会|管理局|管理委员会|人民政府|党委|工作委员会)$'
+        )
+        regex_auths = [t for t in merged_lines if _ORG_PAT.match(t)]
+
+        # 路径0b：LLM识别（补充正则未能覆盖的情况）
+        if config and header_text:
+            try:
+                llm_result = _call_llm_json(
+                    """你是一个政府公文分析助手。从给定的红头文字中识别所有发文主体（即发文机关名称）。
+发文主体是红头区域中的机关名称，如"XX省XX厅"、"XX市XX局"、"XX市XX委"等。
+【重要】联合发文时红头会有多行机关名，每行都是一个独立机关，必须全部列出。
+例如红头有"南京市城市管理局"和"南京市规划局"两行，则输出两个机关。
+不要把发文字号（如"宁城规字〔2018〕4号"）当成机关名。
+不要把标题（如"关于印发...的通知"）当成机关名。
+只输出纯JSON，格式：{"authorities": ["机关名1", "机关名2"]}
+如果无法识别则输出：{"authorities": []}""",
+                    f"红头文字：\n\n{header_text}",
+                    config
+                )
+                llm_auths = llm_result.get("authorities", [])
+            except Exception:
+                llm_auths = []
+
+            # 合并：以正则结果为基础，LLM结果补充正则未覆盖的
+            merged_auths = list(regex_auths)
+            for a in llm_auths:
+                if a not in merged_auths:
+                    merged_auths.append(a)
+            if merged_auths:
+                doc.close()
+                return merged_auths
+
+        if regex_auths:
+            doc.close()
+            return regex_auths
+
+        # 路径1：落款 —— 找日期行，取其正上方行
+        all_pages_lines = []
+        for pg_idx in range(len(doc)):
+            pg = doc[pg_idx]
+            pg_h = pg.rect.height
+            pg_lines = []
+            for block in pg.get_text("dict")["blocks"]:
+                if block.get("type") != 0:
+                    continue
+                for line in block.get("lines", []):
+                    y = line["bbox"][1]
+                    line_text = "".join(s["text"] for s in line["spans"]).strip()
+                    if line_text:
+                        pg_lines.append((y, line_text, pg_h))
+            pg_lines.sort(key=lambda x: x[0])
+            all_pages_lines.append(pg_lines)
+
+        for pg_lines in all_pages_lines:
+            pg_h = pg_lines[0][2] if pg_lines else page_h
+            for i, (y, text, _) in enumerate(pg_lines):
+                if y / pg_h < 0.45:
+                    continue
+                if not _DATE_PAT.search(text):
+                    continue
+                if len(text) > 20:
+                    continue
+                if any(kw in text for kw in ('自', '截至', '起施行', '至今', '印发')):
+                    continue
+                orgs = []
+                prev_collected_y = y
+                for j in range(i - 1, -1, -1):
+                    prev_y, prev_text, _ = pg_lines[j]
+                    if not prev_text:
+                        continue
+                    if any(prev_text.startswith(p) for p in ('抄送', '抄报', '附件', '―', '-', '—')):
+                        continue
+                    if prev_collected_y - prev_y > 60:
+                        break
+                    org_part = prev_text.split()[0] if prev_text.split() else prev_text
+                    if len(org_part) < 4:
+                        break
+                    orgs.append(org_part)
+                    prev_collected_y = prev_y
+                    if len(orgs) >= 5:
+                        break
+                if orgs:
+                    doc.close()
+                    return list(reversed(orgs))
+                break
+
+        # 路径2：文字层红色 span
+        red_lines = []
+        for block in page.get_text("dict")["blocks"]:
+            if block.get("type") != 0:
+                continue
+            for line in block.get("lines", []):
+                y_pct = line["bbox"][1] / page_h
+                if y_pct > 0.35:
+                    continue
+                line_text = "".join(s["text"] for s in line["spans"]).strip()
+                if not line_text:
+                    continue
+                for span in line["spans"]:
+                    c = span.get("color", 0)
+                    r = (c >> 16) & 0xFF
+                    g = (c >> 8) & 0xFF
+                    b = c & 0xFF
+                    if r >= 180 and g < 80 and b < 80:
+                        red_lines.append((line["bbox"][1], line_text))
+                        break
+
+        if red_lines:
+            red_lines.sort(key=lambda x: x[0])
+            authority = red_lines[0][1]
+        else:
+            # 路径3：矢量路径红色填充矩形 + RapidOCR
+            drawings = page.get_drawings()
+            red_rects = []
+            for d in drawings:
+                fill = d.get("fill")
+                if not fill:
+                    continue
+                fr, fg, fb = fill[0], fill[1], fill[2]
+                if fr >= 0.9 and fg < 0.2 and fb < 0.2:
+                    r = d["rect"]
+                    if r.height > 20 and (r.y0 / page_h) < 0.40:
+                        red_rects.append(r)
+            if not red_rects:
+                doc.close()
+                return []
+            x0 = min(r.x0 for r in red_rects) - 5
+            y0 = min(r.y0 for r in red_rects) - 5
+            x1 = max(r.x1 for r in red_rects) + 5
+            y1 = max(r.y1 for r in red_rects) + 5
+            clip = fitz.Rect(max(0, x0), max(0, y0), min(page_w, x1), min(page_h, y1))
+            pix = page.get_pixmap(matrix=fitz.Matrix(3, 3), clip=clip)
+            img_bytes = pix.tobytes("png")
+            try:
+                from rapidocr_onnxruntime import RapidOCR
+                ocr = RapidOCR()
+                result, _ = ocr(img_bytes)
+                if result:
+                    authority = result[0][1].strip()
+                else:
+                    doc.close()
+                    return []
+            except Exception:
+                doc.close()
+                return []
+
+        doc.close()
+        doc_type_suffixes = (
+            "任免通知", "文件", "通告", "公告", "决定", "命令", "批复",
+            "意见", "纪要", "请示", "报告", "通报", "通知", "函", "令",
+        )
+        for suf in doc_type_suffixes:
+            if authority.endswith(suf) and len(authority) > len(suf) + 2:
+                authority = authority[: -len(suf)]
+                break
+        return [authority]
+    except Exception:
+        return []
+
+
+def detect_issuing_authority_from_image_blocks(blocks: list) -> str:
+    """从Qwen-VL识别的blocks中提取发文主体（red_header区域最靠上的行）。"""
+    red_blocks = [b for b in blocks if b.get("region") == "red_header"]
+    if not red_blocks:
+        # 兜底：找颜色包含red、y_pct最小的块
+        red_blocks = [b for b in blocks if "red" in str(b.get("color", "")).lower()]
+    if not red_blocks:
+        return ""
+    red_blocks.sort(key=lambda b: b.get("y_pct", 1.0))
+    text = red_blocks[0].get("text", "").strip()
+    for suffix in ("文件", "函", "令"):
+        if text.endswith(suffix) and len(text) > len(suffix) + 2:
+            text = text[: -len(suffix)]
+    return text
+
+
 # 入口
 # ─────────────────────────────────────────────
 
@@ -2547,7 +2933,7 @@ def main():
             print(f"错误: 文件不存在: {input_path}", file=sys.stderr)
             continue
 
-        output_dir = Path(args.output_dir).expanduser() if args.output_dir else input_path.parent
+        output_dir = Path(args.output_dir).expanduser() if args.output_dir else Path.home() / "Desktop"
         output_dir.mkdir(parents=True, exist_ok=True)
 
         print(f"\n{'='*50}")
@@ -2555,16 +2941,28 @@ def main():
         print(f"输入: {input_path.name}")
         print(f"目标机关: {args.target_authority}")
         print(f"输出目录: {output_dir}")
+
+        # 识别发文主体
+        suffix = input_path.suffix.lower()
+        src_authorities = []
+        if suffix == ".pdf":
+            src_authorities = detect_issuing_authority_from_pdf(input_path, config)
+            if src_authorities:
+                print(f"发文主体: {'、'.join(src_authorities)}")
+            else:
+                print(f"发文主体: 未识别（文字层无红色文字）")
+
         print(f"{'='*50}")
 
-        suffix = input_path.suffix.lower()
+
         try:
             if suffix in IMAGE_SUFFIXES:
                 localize_image(input_path, args.target_province, args.target_authority,
                                config, output_dir, font_dir, skip_vision=args.skip_vision)
             elif suffix == ".pdf":
                 localize_pdf(input_path, args.target_province, args.target_authority,
-                             config, output_dir, font_dir, args.no_preview)
+                             config, output_dir, font_dir, args.no_preview,
+                             src_authorities=src_authorities)
             else:
                 print(f"  不支持的文件格式: {suffix}", file=sys.stderr)
         except Exception as e:
