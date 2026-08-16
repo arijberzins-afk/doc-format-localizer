@@ -1,6 +1,6 @@
 {
-  "dashscope_api_key": "your-dashscope-api-key-here",
-  "qwen_api_key": "your-dashscope-api-key-here",
-  "qwen_endpoint": "https://dashscope.aliyuncs.com/compatible-mode/v1",
-  "llm_disable_proxy": false
+  "dashscope_api_key": "你的API Key",
+  "qwen_api_key": "你的API Key",
+  "qwen_endpoint": "https://ws-dk52xyjnqd5164oh.cn-beijing.maas.aliyuncs.com/compatible-mode/v1",
+  "llm_disable_proxy": true
 }

@@ -198,6 +198,7 @@ def get_api_key(config: dict) -> str:
 def get_endpoint(config: dict) -> str:
     ep = (
         config.get("qwen_api_endpoint")
+        or config.get("qwen_endpoint")
         or config.get("llm_api_endpoint")
         or "https://dashscope.aliyuncs.com/compatible-mode/v1"
     )
@@ -221,8 +222,8 @@ def get_vision_endpoint(config: dict) -> str:
         ep = ep.rstrip("/")
         return ep if ep.endswith("/chat/completions") else f"{ep}/chat/completions"
 
-    # 2. 若 qwen_api_endpoint 像千问/DashScope 地址，沿用
-    qep = config.get("qwen_api_endpoint") or ""
+    # 2. 若 qwen_api_endpoint / qwen_endpoint 像千问/DashScope 地址，沿用
+    qep = config.get("qwen_api_endpoint") or config.get("qwen_endpoint") or ""
     if qep and ("dashscope" in qep or "aliyun" in qep or "qianwen" in qep):
         qep = qep.rstrip("/")
         return qep if qep.endswith("/chat/completions") else f"{qep}/chat/completions"
@@ -297,34 +298,57 @@ def call_vision(image_bytes: bytes, mime: str, prompt: str, config: dict) -> str
 # 逻辑直接借鉴 gov-doc-generator/scripts/localize_document.py
 # ─────────────────────────────────────────────
 
+# 自治区/民族后缀简称映射：全称 → 公文常用简称
+_PROVINCE_SHORTNAME = {
+    "内蒙古自治区": "内蒙古",
+    "广西壮族自治区": "广西",
+    "西藏自治区": "西藏",
+    "新疆维吾尔自治区": "新疆",
+    "宁夏回族自治区": "宁夏",
+    # 直辖市省级写法统一
+    "北京市": "北京",
+    "上海市": "上海",
+    "天津市": "天津",
+    "重庆市": "重庆",
+}
+
+
+def shorten_province(name: str) -> str:
+    """把省份全称转为公文常用简称，避免写入时字数过多撑版面。"""
+    return _PROVINCE_SHORTNAME.get(name, name)
+
+
 MAPPING_SYSTEM = """你是一个政府公文地域替换助手。
 
-从用户提供的公文原文中，找出与原省份/城市相关的地理标识，输出替换词表。
-规则：**只替换地点部分，机关职能、业务类型、项目名称一字不动。**
+从用户提供的公文原文中，找出省市级地名，输出替换词表。
 
-替换规则（只有以下三类）：
+**核心规则：只替换省市地名本身，不带任何后缀（区/县/局/厅/委/处/办/院/部等）。**
 
-1. 省份名/直辖市名/城市名 → 目标省份名
-   - "广东省" → "福建省"，"天津市" → "福建省"，"南京市" → "福建省"
-   - "广东" → "福建"，"南京" → "福建"
+替换规则（只有以下两类）：
 
-2. 机关名称：**只把其中的省份/城市部分换成目标省份，职能部分原样保留**
-   - "广东省人力资源和社会保障厅" → "福建省人力资源和社会保障厅"（只改"广东省"→"福建省"，职能"人力资源和社会保障厅"不动）
-   - "南京市发展和改革委员会" → "福建省发展和改革委员会"（只改"南京市"→"福建省"，职能"发展和改革委员会"不动）
-   - "重庆高新区生态环境局" → "福建省生态环境局"（只改地点，职能"生态环境局"不动）
+1. 省份名/直辖市名 → 目标省份名（目标省份将在用户消息中给出）
+   ✓ 正确示例（假设目标省份为"X省"）：
+     "广东省" → "X省"
+     "天津市" → "X省"
+     "重庆市" → "X省"
+     "南京市" → "X省"
+   ✗ 错误示例（不要输出）：
+     "重庆高新区" → 错误，"高新区"是行政区后缀，只该输出"重庆市"
+     "重庆高新区生态环境局" → 错误，带了机构名
+     "广东省人力资源和社会保障厅" → 错误，带了机构名
 
-3. 发文字号中的省市简称单字 → 目标省简称
-   - "宁发改财金字〔2018〕××号" → {"宁": "闽"}（只改"宁"这一个字，后面的"发改财金字"不动）
-   - "粤人社规〔2021〕5号" → {"粤": "闽"}（只改"粤"，"人社规"不动）
+2. 发文字号中的省市简称单字 → 目标省简称（目标省简称将在用户消息中给出）
+   ✓ 正确示例（假设目标省简称为"X"）：
+     "粤人社规〔2021〕5号" 中 → {"粤": "X"}（只改"粤"这一个字）
+     "宁发改财金字〔2018〕××号" 中 → {"宁": "X"}
 
 绝对不替换：
-- 企业名称、项目名称
-- 正文中描述历史事实的地名（如"与广东省签订了合同"）
+- 企业名称、项目名称中的地名
+- 正文叙述中的历史地名（如"与广东省签订协议"不应改）
 - URL、电话、编号
-- **不含具体省市名的机关缩写**：如"省发展改革委"、"省人社厅"、"市住建局"——这些缩写里没有可替换的地点，不要输出这类词条
-- 机关名称中的职能部分（"人力资源和社会保障厅"、"发展和改革委员会"等）绝对不能改为其他职能
+- 机关职能后缀（局/厅/委/处/办/院/部）
 
-每条原词必须是可在原文中直接搜索到的完整词，不含换行符，长度不超过25字。
+每条原词必须可在原文中直接搜索到，不含换行符，长度不超过10字。
 只输出纯 JSON 对象，格式：{"原词": "新词"}，不加任何解释。"""
 
 
@@ -397,8 +421,8 @@ def build_replacement_mapping(raw_text: str, src_province: str,
         auths_joined = "、".join(src_authorities)
         multi_auth_note = (
             f"\n【重要】本文有{len(src_authorities)}个联合发文机关：{auths_joined}。"
-            f"每个机关只把省市地点前缀改为\u300c福建省\u300d或\u300c闽\u300d，职能后缀原样保留，不要把不同职能的机关名混淆合并。"
-            f"例如：城市管理局\u2192福建省城市管理局，规划局\u2192福建省规划局，不要都变成{tgt_authority}。"
+            f"每个机关只把省市地点前缀改为\u300c{tgt_province}\u300d，职能后缀原样保留，不要把不同职能的机关名混淆合并。"
+            f"例如：城市管理局\u2192{tgt_province}城市管理局，规划局\u2192{tgt_province}规划局，不要都变成{tgt_authority}。"
         )
     else:
         multi_auth_note = ""
@@ -444,21 +468,6 @@ def build_replacement_mapping(raw_text: str, src_province: str,
         mapping[k] = v
 
     print(f"  词表生成 {len(mapping)} 条替换对")
-
-    # 自动派生裸前缀：X市→Y省 同时补一条 X→Y前缀（覆盖公司名/地名里不带"市/省"的裸字）
-    # 例如 重庆市→福建省 派生 重庆→福建；广东省→福建省 派生 广东→福建
-    extra = {}
-    for k, v in list(mapping.items()):
-        for suffix in ('市', '省', '区', '县'):
-            if k.endswith(suffix) and len(k) >= 3:
-                bare_k = k[:-1]          # 去掉最后一个行政后缀
-                bare_v = v.rstrip('市省区县')  # 对应去掉目标的后缀
-                if bare_k in raw_text and bare_k not in mapping:
-                    extra[bare_k] = bare_v
-                break
-    mapping.update(extra)
-    if extra:
-        print(f"  派生裸前缀 {len(extra)} 条: {list(extra.items())}")
 
     return mapping
 
@@ -1412,10 +1421,12 @@ def localize_image(
     output_dir: Path,
     font_dir: Path = None,
     skip_vision: bool = False,
+    explicit_mapping: dict = None,
 ) -> Path:
     """图片格式保留本地化主流程。"""
     if not PIL_OK:
         raise RuntimeError("图片处理需要 Pillow，请运行: pip install Pillow")
+    tgt_province = shorten_province(tgt_province)
 
     # 每次调用清空字体匹配缓存（不同文件可能布局不同）
     font_match_cache.clear()
@@ -1445,6 +1456,7 @@ def localize_image(
     print("  [图片] Step2: 生成替换词表...")
     raw_text = extract_ocr_text_from_blocks(blocks)
     mapping = build_replacement_mapping(raw_text, "", tgt_province, tgt_authority, config)
+    mapping.update(explicit_mapping or {})
     print(f"  替换词表（{len(mapping)}条）:")
     for k, v in mapping.items():
         print(f"    [{k}] → [{v}]")
@@ -1958,41 +1970,174 @@ def localize_pdf(
     font_dir: Path = None,
     no_preview: bool = False,
     src_authorities: list = None,
+    explicit_mapping: dict = None,
 ) -> Path:
     """PDF 格式保留本地化主流程。"""
     if not FITZ_OK:
         raise RuntimeError("PDF 处理需要 PyMuPDF，请运行: pip install pymupdf")
+    tgt_province = shorten_province(tgt_province)
 
     doc = fitz.open(str(pdf_path))
 
     print("  [PDF] Step1: 提取文字层...")
-    all_text_parts = []
+    page_texts = []  # 每页的文本，保留原始分页
     for i, page in enumerate(doc):
         text = page.get_text().strip()
-        if text:
-            all_text_parts.append(text)
+        page_texts.append(text)
+    all_text_parts = [t for t in page_texts if t]
     raw_text = "\n".join(all_text_parts)
 
     # 文字层不足则用Qwen-VL OCR
     cjk_count = len(re.findall(r'[\u4e00-\u9fff]', raw_text))
     if cjk_count < 30:
         print("  文字层中文不足，调用Qwen-VL OCR...")
-        ocr_parts = []
+        page_texts = []
         for i, page in enumerate(doc):
             pixmap = page.get_pixmap(matrix=fitz.Matrix(200/72, 200/72), alpha=False)
             png_bytes = pixmap.tobytes("png")
             text = call_vision(png_bytes, "image/png",
                                "请逐行转写这张政府公文图片中的全部文字，保持原顺序，只输出文字。",
                                config)
-            ocr_parts.append(text)
+            page_texts.append(text)
             print(f"    第{i+1}页OCR完成")
-        raw_text = "\n".join(ocr_parts)
+        raw_text = "\n".join(t for t in page_texts if t)
 
-    print("  [PDF] Step2: LLM生成替换词表...")
-    mapping = build_replacement_mapping(raw_text, "", tgt_province, tgt_authority, config, src_authorities=src_authorities)
-    print(f"  替换词表（{len(mapping)}条）:")
+    print("  [PDF] Step2: LLM分批生成替换词表（每3页一批）...")
+    # 按3页一批调用LLM，合并词表（先出现的条目优先，不覆盖）
+    PAGES_PER_CHUNK = 3
+    mapping = {}
+    total_pages = len(page_texts)
+    chunk_count = 0
+    for chunk_start in range(0, total_pages, PAGES_PER_CHUNK):
+        chunk_end = min(chunk_start + PAGES_PER_CHUNK, total_pages)
+        chunk_pages = page_texts[chunk_start:chunk_end]
+        chunk_text = "\n".join(t for t in chunk_pages if t).strip()
+        if not chunk_text:
+            continue
+        chunk_count += 1
+        page_range = f"第{chunk_start+1}-{chunk_end}页"
+        print(f"    [{page_range}] 调用LLM（{len(chunk_text)}字）...")
+        chunk_mapping = build_replacement_mapping(
+            chunk_text, "", tgt_province, tgt_authority, config,
+            src_authorities=src_authorities
+        )
+        # 合并：新批次的条目不覆盖已有条目（先出现的优先）
+        new_count = 0
+        for k, v in chunk_mapping.items():
+            if k not in mapping:
+                mapping[k] = v
+                new_count += 1
+        print(f"    [{page_range}] 新增{new_count}条，累计{len(mapping)}条")
+    print(f"  替换词表（共{len(mapping)}条，来自{chunk_count}批）:")
     for k, v in mapping.items():
         print(f"    [{k}] → [{v}]")
+
+    # ── 正则兜底：补充 LLM 词表可能漏掉的内容 ──────────────────────────────
+    import re as _re2
+
+    _ABBR_MAP = {
+        "广东": "粤", "江苏": "苏", "南京": "宁", "重庆": "渝",
+        "浙江": "浙", "山东": "鲁", "河南": "豫", "湖北": "鄂",
+        "湖南": "湘", "四川": "川", "陕西": "陕", "辽宁": "辽",
+        "河北": "冀", "山西": "晋", "吉林": "吉", "黑龙江": "黑",
+        "安徽": "皖", "江西": "赣", "贵州": "黔", "云南": "滇",
+        "甘肃": "甘", "青海": "青", "广西": "桂", "海南": "琼",
+        "西藏": "藏", "新疆": "新", "内蒙古": "蒙", "宁夏": "宁",
+        "上海": "沪", "北京": "京", "天津": "津",
+        # 常见城市（有文号简称需求的）
+        "广州": "穗", "深圳": "深", "成都": "蓉", "武汉": "汉",
+        "杭州": "杭", "西安": "西", "苏州": "苏", "宁波": "甬",
+        "无锡": "锡", "沈阳": "沈", "哈尔滨": "哈", "长沙": "长",
+        "福州": "榕", "厦门": "厦", "泉州": "泉",
+        "福建": "闽",
+    }
+
+    # 动态推导目标省简称（从 _ABBR_MAP 查找，找不到则取省份名第一个字）
+    _tgt_bare = _re2.sub(r'[省市自治区自治州]+$', '', tgt_province)
+    _tgt_abbr = _ABBR_MAP.get(_tgt_bare, _tgt_bare[0] if _tgt_bare else tgt_province[0])
+
+    # 推导需要替换的省市地名
+    _src_geo_names = set()
+    _src_abbrs = set()
+    if src_authorities:
+        for auth in src_authorities:
+            # 跳过中共开头
+            auth_stripped = _re2.sub(r'^中共', '', auth)
+            # 先尝试标准省/市/自治区格式
+            m = _re2.match(r'^([\u4e00-\u9fff]{2,6}(?:省|市|自治区|自治州))', auth_stripped)
+            if m:
+                geo = m.group(1)
+                bare = _re2.sub(r'[省市自治区自治州]+$', '', geo)
+                if bare not in _ABBR_MAP:
+                    continue
+                _src_geo_names.add(geo)
+                _src_geo_names.add(bare)
+                abbr = _ABBR_MAP.get(bare)
+                if abbr and abbr != _tgt_abbr:
+                    _src_abbrs.add(abbr)
+            else:
+                # 标准格式匹不上时，尝试以已知省市裸名开头（如"重庆高新区..."）
+                for known_bare in sorted(_ABBR_MAP.keys(), key=lambda x: -len(x)):
+                    if auth_stripped.startswith(known_bare) and known_bare != _tgt_bare:
+                        _src_geo_names.add(known_bare)
+                        abbr = _ABBR_MAP.get(known_bare)
+                        if abbr and abbr != _tgt_abbr:
+                            _src_abbrs.add(abbr)
+                        break
+
+    _extra_count = 0
+    _tgt_province_bare = _re2.sub(r'[省市自治区]+$', '', tgt_province)
+
+    # 正则兜底暂时禁用
+    _REGEX_FALLBACK_ENABLED = False
+
+    if _REGEX_FALLBACK_ENABLED:
+     # 1. 文号正则：简称[可选括号机构]汉字〔年〕编号号
+     _all_abbrs = ''.join(_src_abbrs) if _src_abbrs else '粤苏宁渝浙鲁豫鄂湘川陕辽冀晋吉黑皖赣黔滇甘青桂琼藏新蒙沪京津'
+     _DOC_NO_PAT = _re2.compile(
+         r'([' + _all_abbrs + r']'
+         r'(?:[（(][^）)]{1,10}[）)])?'
+         r'[\u4e00-\u9fff]{1,8}'
+         r'[〔\[【「『]'
+         r'\d{4}'
+         r'[〕\]】」』]'
+         r'[\d\s]{1,8}'
+         r'号)'
+     )
+     for m in _DOC_NO_PAT.finditer(raw_text):
+         doc_no = m.group(1)
+         first_char = doc_no[0]
+         if first_char != _tgt_abbr and doc_no not in mapping:
+             new_doc_no = _tgt_abbr + doc_no[1:]
+             mapping[doc_no] = new_doc_no
+             print(f"  [正则兜底-文号] [{doc_no}] → [{new_doc_no}]")
+             _extra_count += 1
+
+     # 2. 地名兜底：省市名（长词优先，避免短词先占）
+     for geo in sorted(_src_geo_names, key=lambda x: -len(x)):
+         if geo in mapping or not geo:
+             continue
+         if geo not in raw_text:
+             continue
+         bare = _re2.sub(r'[省市自治区自治州]+$', '', geo)
+         suffix = geo[len(bare):]
+         if bare == _tgt_province_bare:
+             continue
+         if suffix == '市':
+             new_geo = tgt_province
+         elif suffix in ('省', ''):
+             new_geo = tgt_province if suffix == '省' else _tgt_province_bare
+         else:
+             new_geo = tgt_province
+         mapping[geo] = new_geo
+         print(f"  [正则兜底-地名] [{geo}] → [{new_geo}]")
+         _extra_count += 1
+
+    if _extra_count:
+        print(f"  正则兜底共补充 {_extra_count} 条")
+
+    # Explicit workflow mappings are authoritative and override LLM/regex guesses.
+    mapping.update(explicit_mapping or {})
 
     if not mapping:
         print("  无需替换内容，跳过")
@@ -2179,7 +2324,7 @@ def localize_pdf(
                     seq = [char_map[idx] for idx in all_indices if char_map[idx][0] != ' ']
                     # 确认没有被覆盖
                     if not any(idx in covered_char_indices for idx in all_indices):
-                        found_sequences.append((i, seq))
+                        found_sequences.append((i, seq, all_indices))
                         for idx in all_indices:
                             covered_char_indices.add(idx)
                         i = matched[-1][0] + 1
@@ -2192,7 +2337,7 @@ def localize_pdf(
             new_chars = [c for c in new_word if c != ' ']
             m = len(new_chars)
 
-            for start_idx, seq in found_sequences:
+            for start_idx, seq, all_indices in found_sequences:
                 # 取该词第一个字的实际字体（seq[0][4]）和行首样式（用于判断红头/标题）
                 ch_line_idx = seq[0][7]
                 line_sf, line_ss, line_sc = line_first_style.get(ch_line_idx, (seq[0][4], seq[0][5], seq[0][6]))
@@ -2260,20 +2405,102 @@ def localize_pdf(
                     # 等长非红头：新字逐一对齐原字位置
                     positions = [(seq[j][1], seq[j][2], seq[j][3]) for j in range(n)]
                 else:
-                    # 新词长度不等（非红头）：把 m 个新字均匀分布在原词总宽度内
-                    x0_first = seq[0][1]
-                    x0_last  = seq[-1][1]
-                    total_w  = x0_last - x0_first + (seq[-1][3][2] - seq[-1][3][0])
-                    char_w   = total_w / m
-                    base_y   = seq[0][2]
-                    positions = [
-                        (x0_first + j * char_w, base_y,
-                         (x0_first + j * char_w,
-                          seq[0][3][1],
-                          x0_first + (j + 1) * char_w,
-                          seq[0][3][3]))
-                        for j in range(m)
-                    ]
+                    # 新词字数不等（非红头）
+                    extra = m - n  # 正数=新词更多字，负数=新词更少字
+                    if extra <= 0:
+                        # 新词更短或等长：均匀压缩进原词总宽度
+                        x0_first = seq[0][1]
+                        x0_last  = seq[-1][1]
+                        total_w  = x0_last - x0_first + (seq[-1][3][2] - seq[-1][3][0])
+                        char_w   = total_w / m if m > 0 else total_w
+                        base_y   = seq[0][2]
+                        positions = [
+                            (x0_first + j * char_w, base_y,
+                             (x0_first + j * char_w,
+                              seq[0][3][1],
+                              x0_first + (j + 1) * char_w,
+                              seq[0][3][3]))
+                            for j in range(m)
+                        ]
+                        borrow_left  = []
+                        borrow_right = []
+                    else:
+                        # 新词更多字：向左右借邻字，把整段重排
+                        seq_line_idx = seq[0][7]
+                        seq_color    = seq[0][6]
+                        first_cm_idx = all_indices[0]
+                        last_cm_idx  = all_indices[-1]
+
+                        def _can_borrow(cm_idx):
+                            """邻字可借：同行、同颜色、未被覆盖、非空格"""
+                            if cm_idx < 0 or cm_idx >= len(char_map):
+                                return False
+                            ch = char_map[cm_idx]
+                            return (ch[0] != ' ' and ch[7] == seq_line_idx
+                                    and ch[6] == seq_color
+                                    and cm_idx not in covered_char_indices)
+
+                        # 向左借（最多4个）
+                        borrow_left = []
+                        li = first_cm_idx - 1
+                        while len(borrow_left) < 4 and li >= 0:
+                            if _can_borrow(li):
+                                borrow_left.insert(0, li)
+                            li -= 1
+
+                        # 向右借（最多4个）
+                        borrow_right = []
+                        ri = last_cm_idx + 1
+                        while len(borrow_right) < 4 and ri < len(char_map):
+                            if _can_borrow(ri):
+                                borrow_right.append(ri)
+                            ri += 1
+
+                        # 合并：左邻 + 原词 + 右邻，计算总 x 范围
+                        all_seg = (
+                            [char_map[i] for i in borrow_left] +
+                            seq +
+                            [char_map[i] for i in borrow_right]
+                        )
+                        total_chars = len(borrow_left) + m + len(borrow_right)
+                        x0_seg = all_seg[0][3][0]   # bbox 左
+                        x1_seg = all_seg[-1][3][2]  # bbox 右
+                        seg_w  = x1_seg - x0_seg
+                        char_w = seg_w / total_chars if total_chars > 0 else seg_w
+                        base_y = seq[0][2]
+
+                        # 新字插入位置：跳过左邻偏移，从原词对应段开始
+                        left_offset = len(borrow_left)
+                        positions = [
+                            (x0_seg + (left_offset + j) * char_w, base_y,
+                             (x0_seg + (left_offset + j) * char_w,
+                              seq[0][3][1],
+                              x0_seg + (left_offset + j + 1) * char_w,
+                              seq[0][3][3]))
+                            for j in range(m)
+                        ]
+
+                        # 将左右邻字也标记覆盖（需要重写它们）
+                        for bi in borrow_left + borrow_right:
+                            covered_char_indices.add(bi)
+
+                        # 重写左邻字（原字符不变，只更新位置，字体与主词一致）
+                        for k_b, bi in enumerate(borrow_left):
+                            bch = char_map[bi]
+                            bx = x0_seg + k_b * char_w
+                            boy = bch[2]
+                            br, bg_, bb_ = ((bch[6] >> 16) & 0xFF) / 255.0, ((bch[6] >> 8) & 0xFF) / 255.0, (bch[6] & 0xFF) / 255.0
+                            _er_b = fitz.Rect(bch[3][0], bch[3][1], bch[3][2], bch[3][3])
+                            replace_ops_char.append((_er_b, bch[0], font_path, font_key, float(bch[5]), (br, bg_, bb_), bx, boy, (1.0, 1.0)))
+
+                        # 重写右邻字
+                        for k_b, bi in enumerate(borrow_right):
+                            bch = char_map[bi]
+                            bx = x0_seg + (left_offset + m + k_b) * char_w
+                            boy = bch[2]
+                            br, bg_, bb_ = ((bch[6] >> 16) & 0xFF) / 255.0, ((bch[6] >> 8) & 0xFF) / 255.0, (bch[6] & 0xFF) / 255.0
+                            _er_b = fitz.Rect(bch[3][0], bch[3][1], bch[3][2], bch[3][3])
+                            replace_ops_char.append((_er_b, bch[0], font_path, font_key, float(bch[5]), (br, bg_, bb_), bx, boy, (1.0, 1.0)))
 
                 # erase rect：每个原字单独擦除（用原字的 bbox）
                 # 红头行用颜色mask精确边界，其余行精确匹配bbox
@@ -2296,11 +2523,10 @@ def localize_pdf(
                         ox, oy, pos_bbox = positions[j]
                     else:
                         break
-                    # 每个新字对应擦除：若新词比原词短，最后一个新字负责擦剩余原字
+                    # 每个新字对应擦除原词第j个字
                     if j < n:
                         _er = _make_char_erase_rect(seq[j], is_red_line)
                     elif j == n - 1:
-                        # 新词更长时最后对应原字已是最后一个，直接用最后一个原字 rect
                         _er = _make_char_erase_rect(seq[n - 1], is_red_line)
                     else:
                         _er = None
@@ -2325,6 +2551,16 @@ def localize_pdf(
             for idx in covered_char_indices
             if idx < len(char_map)
         }
+        # 对于每字单独成行的红头（字间距排版），按 oy 分组：已替换字符的 oy
+        replaced_red_oys = set()
+        for idx in covered_char_indices:
+            if idx < len(char_map):
+                ch_sc_val = char_map[idx][6]  # ch_sc
+                r_ = (ch_sc_val >> 16) & 0xFF
+                g_ = (ch_sc_val >> 8) & 0xFF
+                b_ = ch_sc_val & 0xFF
+                if r_ > 200 and g_ < 50 and b_ < 50:
+                    replaced_red_oys.add(round(char_map[idx][2], 1))  # ch_oy
 
         def _is_title_line(line_sc, line_ss, line_sf):
             """判断是否为标题行：使用动态识别结果。"""
@@ -2349,8 +2585,8 @@ def localize_pdf(
             if is_title:
                 # 标题行全部重写，不检查 replaced_line_indices
                 pass
-            elif is_red and ch_li in replaced_line_indices:
-                # 红头行只处理被替换的行
+            elif is_red and (ch_li in replaced_line_indices or round(ch_oy, 1) in replaced_red_oys):
+                # 红头行：按 line_idx 或 oy 匹配（兼容每字单独成行的字间距红头排版）
                 pass
             else:
                 # 既不是标题行，也不是被替换的红头行，跳过
@@ -2507,13 +2743,19 @@ def localize_pdf(
                 orig_text_width = line_x1 - line_x0
 
                 if _red_rule_width > 0:
-                    target_width = _red_rule_width
-                    print(f"      [红头] 原红头文字宽度={orig_text_width:.1f}pt, 红线宽度={_red_rule_width:.1f}pt, 使用红线宽度作为目标")
+                    # 有红线时：若原行宽度明显小于红线宽度（不足60%），
+                    # 说明该行是较短的副行，保留原行宽度避免过度拉伸超出页面
+                    if orig_text_width < _red_rule_width * 0.6:
+                        target_width = orig_text_width
+                        print(f"      [红头] 原红头文字宽度={orig_text_width:.1f}pt, 红线宽度={_red_rule_width:.1f}pt, 行较短保留原宽度")
+                    else:
+                        target_width = _red_rule_width
+                        print(f"      [红头] 原红头文字宽度={orig_text_width:.1f}pt, 红线宽度={_red_rule_width:.1f}pt, 使用红线宽度作为目标")
                 else:
                     target_width = orig_text_width
                     print(f"      [红头] 原红头文字宽度={target_width:.1f}pt (无红线)")
 
-                if _red_rule_width > 0:
+                if _red_rule_width > 0 and orig_text_width >= _red_rule_width * 0.6:
                     page_center_x = page.rect.width / 2
                     line_cx = page_center_x
                     print(f"      [红头] 使用页面中心 x={page_center_x:.1f}")
@@ -2904,9 +3146,9 @@ def main():
     )
     parser.add_argument("--input", required=True, action="append", dest="inputs",
                         help="输入文件（图片或PDF），可重复指定")
-    parser.add_argument("--target-authority", default="福建省人力资源和社会保障厅",
-                        help="目标发文机关全称")
-    parser.add_argument("--target-province", default="福建省",
+    parser.add_argument("--target-authority", default=None,
+                        help="目标发文机关全称（可选，不填则自动从原文机关名推导）")
+    parser.add_argument("--target-province", required=True,
                         help="目标省份名称")
     parser.add_argument("--config", help="配置文件路径（config.json）")
     parser.add_argument("--output-dir", help="输出目录，默认与输入文件同目录")
@@ -2914,7 +3156,21 @@ def main():
     parser.add_argument("--no-preview", action="store_true", help="跳过PDF预览PNG生成")
     parser.add_argument("--skip-vision", action="store_true",
                         help="跳过Qwen-VL，复用输出目录中已有的 _blocks.json 缓存")
+    parser.add_argument("--replacements-json",
+                        help="可选显式替换JSON对象，键为原文，值为目标文字；显式映射优先")
     args = parser.parse_args()
+
+    explicit_mapping = {}
+    if args.replacements_json:
+        replacements_path = Path(args.replacements_json).expanduser().resolve()
+        loaded_mapping = json.loads(replacements_path.read_text(encoding="utf-8-sig"))
+        if not isinstance(loaded_mapping, dict):
+            raise ValueError("--replacements-json 必须包含JSON对象")
+        explicit_mapping = {
+            str(key): str(value)
+            for key, value in loaded_mapping.items()
+            if str(key).strip() and str(value).strip()
+        }
 
     config_path = Path(args.config).expanduser() if args.config else None
     # 未指定config则尝试从兄弟目录找gov-doc-generator的config
@@ -2939,7 +3195,9 @@ def main():
         print(f"\n{'='*50}")
         print(f"格式保留本地化")
         print(f"输入: {input_path.name}")
-        print(f"目标机关: {args.target_authority}")
+        # 在 main 层面也做 shorten，供目标机关推导使用
+        target_province_short = shorten_province(args.target_province)
+        print(f"目标省份: {target_province_short}")
         print(f"输出目录: {output_dir}")
 
         # 识别发文主体
@@ -2952,17 +3210,56 @@ def main():
             else:
                 print(f"发文主体: 未识别（文字层无红色文字）")
 
-        print(f"{'='*50}")
+        # 推导目标机关名：若用户未指定，则只把省市裸名替换为目标省份裸名，后缀不动
+        tgt_authority = args.target_authority
+        if not tgt_authority:
+            if src_authorities:
+                import re as _re_auth
+                first_src = src_authorities[0]
+                stripped = _re_auth.sub(r'^中共', '', first_src)
+                tgt_bare = _re_auth.sub(r'(?:省|市|自治区|自治州)$', '', target_province_short)
+                # 先尝试标准省/市/自治区格式（如"南京市"、"广东省"）
+                # 用非贪婪 {2,6}? 避免"天津市市场..."误匹配成"天津市市"
+                replaced, n = _re_auth.subn(
+                    r'^[\u4e00-\u9fff]{2,6}?(?:自治区|自治州|省|市)(?!场|局|委|厅|院|所|办)',
+                    target_province_short, stripped, count=1
+                )
+                if n == 0:
+                    # 标准格式匹不上，找开头匹配的省市裸名（如"重庆"在"重庆高新区..."）
+                    _KNOWN_BARE = [
+                        '内蒙古', '黑龙江', '广东', '江苏', '浙江', '山东', '河南', '湖北',
+                        '湖南', '四川', '陕西', '辽宁', '河北', '山西', '吉林', '安徽',
+                        '江西', '贵州', '云南', '甘肃', '青海', '广西', '海南', '西藏',
+                        '新疆', '宁夏', '上海', '北京', '天津', '重庆', '福建',
+                        '南京', '杭州', '武汉', '成都', '西安', '沈阳', '哈尔滨',
+                        '济南', '青岛', '厦门', '深圳', '广州', '长沙', '郑州',
+                    ]
+                    for bare in sorted(_KNOWN_BARE, key=lambda x: -len(x)):
+                        if stripped.startswith(bare):
+                            replaced = tgt_bare + stripped[len(bare):]
+                            n = 1
+                            break
+                if n:
+                    tgt_authority = replaced
+                else:
+                    tgt_authority = target_province_short
+                print(f"目标机关（自动推导）: {tgt_authority}")
+            else:
+                tgt_authority = target_province_short
+                print(f"目标机关（兜底）: {tgt_authority}")
 
+        print(f"{'='*50}")
 
         try:
             if suffix in IMAGE_SUFFIXES:
-                localize_image(input_path, args.target_province, args.target_authority,
-                               config, output_dir, font_dir, skip_vision=args.skip_vision)
+                localize_image(input_path, target_province_short, tgt_authority,
+                               config, output_dir, font_dir, skip_vision=args.skip_vision,
+                               explicit_mapping=explicit_mapping)
             elif suffix == ".pdf":
-                localize_pdf(input_path, args.target_province, args.target_authority,
+                localize_pdf(input_path, target_province_short, tgt_authority,
                              config, output_dir, font_dir, args.no_preview,
-                             src_authorities=src_authorities)
+                             src_authorities=src_authorities,
+                             explicit_mapping=explicit_mapping)
             else:
                 print(f"  不支持的文件格式: {suffix}", file=sys.stderr)
         except Exception as e:
