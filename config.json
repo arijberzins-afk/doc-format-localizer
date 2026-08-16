@@ -1,0 +1,6 @@
+{
+  "dashscope_api_key": "sk-ws-H.EPDMMHP.IMOa.MEYCIQD-Fi0dtfOoe9zrkga7rkr22ZOuONJDwDhmGUq1GYdFcgIhAMQD5wYzEYNhNk4QHlJXwgCu_LVaQsK4F057W_1Qk5J6",
+  "qwen_api_key": "sk-ws-H.EPDMMHP.IMOa.MEYCIQD-Fi0dtfOoe9zrkga7rkr22ZOuONJDwDhmGUq1GYdFcgIhAMQD5wYzEYNhNk4QHlJXwgCu_LVaQsK4F057W_1Qk5J6",
+  "qwen_endpoint": "https://ws-dk52xyjnqd5164oh.cn-beijing.maas.aliyuncs.com/compatible-mode/v1",
+  "llm_disable_proxy": true
+}
